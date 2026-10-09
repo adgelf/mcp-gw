@@ -1,0 +1,64 @@
+# Compose broker-mode gateway config (used with deploy/compose/docker-compose.broker.yaml).
+# Copy outside the repository and replace mcp.example.com with your public HTTPS host.
+# /mcp is authenticated against the built-in broker; broker and provider-callback
+# routes pass through to the Google Workspace wrapper.
+binds:
+  - port: 3000
+    listeners:
+      - routes:
+          - matches:
+              - path:
+                  exact: /mcp
+              - path:
+                  exact: /.well-known/oauth-protected-resource/mcp
+            policies:
+              cors:
+                allowOrigins: ["*"]
+                allowHeaders: [mcp-protocol-version, content-type, authorization]
+                exposeHeaders: [Mcp-Session-Id]
+              mcpAuthentication:
+                mode: strict
+                providers:
+                  - issuer: https://mcp.example.com/oauth
+                    audiences:
+                      - https://mcp.example.com/mcp
+                    jwks:
+                      url: http://google-workspace:8080/oauth/.well-known/jwks.json
+                    allowedAlgorithms: [RS256]
+                    jwtValidationOptions:
+                      requiredClaims: [exp, iss, sub, aud]
+                    discoverable: false
+                resourceMetadata:
+                  resource: https://mcp.example.com/mcp
+                  authorizationServers:
+                    - https://mcp.example.com/oauth
+                  scopesSupported: [openid, email]
+                  bearerMethodsSupported: [header]
+            backends:
+              - mcp:
+                  failureMode: failOpen
+                  prefixMode: never
+                  targets:
+                    - name: google
+                      policies:
+                        backendAuth:
+                          passthrough: {}
+                      mcp:
+                        host: http://google-workspace:8080/mcp
+          - matches:
+              - path:
+                  exact: /.well-known/oauth-authorization-server/oauth
+              - path:
+                  exact: /oauth/authorize
+              - path:
+                  exact: /oauth/token
+              - path:
+                  exact: /oauth/register
+              - path:
+                  exact: /oauth/.well-known/jwks.json
+              - path:
+                  exact: /oauth/google/broker/callback
+              - path:
+                  exact: /oauth/google/callback
+            backends:
+              - host: google-workspace:8080

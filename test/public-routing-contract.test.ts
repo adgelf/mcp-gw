@@ -6,6 +6,7 @@ const DEPLOYED_PUBLIC_SURFACE_FILES = [
   "gateway/agentgateway/local-smoke.yaml",
   "gateway/agentgateway/local-full-bundle-smoke.yaml",
   "gateway/agentgateway/local-github-smoke.yaml",
+  "gateway/agentgateway/local-broker.yaml",
   "deploy/k8s/chart/templates/agentgateway/configmap.yaml",
   "deploy/k8s/chart/values.yaml",
 ];

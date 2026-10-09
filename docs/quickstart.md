@@ -58,6 +58,79 @@ fields; see the commented example in `deploy/compose/.env.example`. To also run
 the GitHub MCP backend locally, use the `deploy/compose/docker-compose.github-mcp.yaml`
 overlay and fill the `GITHUB_*` values.
 
+### Path A, variant — Compose with the built-in OAuth broker
+
+Use this when you have no OIDC provider to register and only need Google
+Workspace. Google signs the user in, the wrapper's built-in broker issues the
+HOP-1 token, and MCP clients that support OAuth discovery and dynamic client
+registration connect without a pre-minted token. Leave the `HOP1_*` values
+empty; do not use `https://accounts.google.com` as a HOP-1 issuer.
+
+The broker rejects loopback, private, and non-HTTPS hosts, so the issuer,
+resource, and callback must share one public HTTPS origin. For local
+evaluation, publish `GATEWAY_PORT` through an HTTPS tunnel with a stable
+hostname (for example an ngrok reserved domain:
+`ngrok http --url=<public-host> 8080`). The examples below use
+`mcp.example.com`.
+
+1. Create a signing key outside the repository (any Node.js 18+):
+
+   ```bash
+   mkdir -p ~/.config/mcp-gw/broker && chmod 700 ~/.config/mcp-gw/broker
+   KID=local-broker-1 OUT=~/.config/mcp-gw/broker/signing-jwks.json node -e '
+   const { generateKeyPairSync } = require("node:crypto");
+   const { writeFileSync } = require("node:fs");
+   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+   const jwk = { ...privateKey.export({ format: "jwk" }), kid: process.env.KID, alg: "RS256", use: "sig" };
+   writeFileSync(process.env.OUT, JSON.stringify({ keys: [jwk] }) + "\n", { flag: "wx", mode: 0o600 });
+   '
+   ```
+
+2. Copy the gateway template and set your host:
+
+   ```bash
+   sed 's/mcp\.example\.com/<public-host>/g' gateway/agentgateway/local-broker.yaml \
+     > ~/.config/mcp-gw/agentgateway-broker.yaml
+   ```
+
+   It authenticates `/mcp` against the broker and passes the broker routes
+   (`/oauth/authorize`, `/oauth/token`, `/oauth/register`, metadata, JWKS) and
+   both Google callbacks through to the wrapper.
+
+3. Register both redirect URIs on the Google OAuth client (see
+   [Google OAuth client](#google-oauth-client-hop-2)):
+   `https://<public-host>/oauth/google/broker/callback` and
+   `https://<public-host>/oauth/google/callback`.
+
+4. Add to `deploy/compose/.env` alongside the `GOOGLE_*` values:
+
+   ```dotenv
+   GOOGLE_OAUTH_REDIRECT_URI=https://mcp.example.com/oauth/google/callback
+   MCP_AUTHORIZATION_ISSUER=https://mcp.example.com/oauth
+   MCP_RESOURCE_URI=https://mcp.example.com/mcp
+   MCP_BROKER_GOOGLE_REDIRECT_URI=https://mcp.example.com/oauth/google/broker/callback
+   MCP_BROKER_ACTIVE_KID=local-broker-1
+   LOCAL_BROKER_SIGNING_JWKS_DIR=/Users/<you>/.config/mcp-gw/broker
+   BROKER_GATEWAY_CONFIG=/Users/<you>/.config/mcp-gw/agentgateway-broker.yaml
+   ```
+
+5. Start with the overlay and point the client at the public URL:
+
+   ```bash
+   docker compose -f deploy/compose/docker-compose.yaml \
+     -f deploy/compose/docker-compose.broker.yaml up -d --build
+   claude mcp add --transport http mcp-gw https://mcp.example.com/mcp
+   ```
+
+   `curl https://<public-host>/.well-known/oauth-protected-resource/mcp` should
+   list `https://<public-host>/oauth` under `authorization_servers`.
+
+On macOS, set `AUDIT_LOG_DIR` to a directory you own (for example
+`~/.config/mcp-gw/audit`); the default `/var/log/mcp-gw` does not exist there,
+and an unwritable audit log fails every audited tool call. For the Kubernetes
+form of this mode see
+[`customer-google-broker-deployment.md`](customer-google-broker-deployment.md).
+
 ### Path B — Kubernetes via Helm (OCI)
 
 The Helm chart requires Kubernetes 1.32 or newer.

@@ -1,0 +1,20 @@
+# Optional overlay: run the built-in OAuth broker as the HOP-1 authority. See the
+# "Compose with the built-in OAuth broker" section of docs/quickstart.md.
+services:
+  agentgateway:
+    volumes:
+      - ${BROKER_GATEWAY_CONFIG:?set BROKER_GATEWAY_CONFIG to your copy of gateway/agentgateway/local-broker.yaml}:/etc/agentgateway/config.yaml:ro
+
+  google-workspace:
+    environment:
+      MCP_BROKER_ENABLED: "true"
+      MCP_AUTHORIZATION_ISSUER: ${MCP_AUTHORIZATION_ISSUER}
+      MCP_RESOURCE_URI: ${MCP_RESOURCE_URI}
+      MCP_BROKER_GOOGLE_REDIRECT_URI: ${MCP_BROKER_GOOGLE_REDIRECT_URI}
+      MCP_BROKER_SIGNING_JWKS_FILE: /var/run/secrets/mcp-gateway/broker/signing-jwks.json
+      MCP_BROKER_ACTIVE_KID: ${MCP_BROKER_ACTIVE_KID}
+      MCP_BROKER_SCOPES: openid email
+      MCP_DCR_ENABLED: "true"
+      MCP_DCR_ALLOW_LOOPBACK_REDIRECTS: ${MCP_DCR_ALLOW_LOOPBACK_REDIRECTS:-true}
+    volumes:
+      - ${LOCAL_BROKER_SIGNING_JWKS_DIR:?set LOCAL_BROKER_SIGNING_JWKS_DIR to the directory holding signing-jwks.json}:/var/run/secrets/mcp-gateway/broker:ro
