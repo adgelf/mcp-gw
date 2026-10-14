@@ -77,6 +77,7 @@ describe("local Docker integration smoke", () => {
     expect(smoke).toContain("HOP1_SUBJECT_CLAIM=oid");
     expect(smoke).toContain('--email-claim "mail"');
     expect(smoke).toContain('--subject-claim "oid"');
+    expect(smoke).toContain('--claims-file "$ROOT_DIR/test/fixtures/task-authority-hop1-v3.json"');
     expect(smoke).toContain('"emailClaim":"mail","subjectClaim":"oid"');
     expect(smoke).toContain('"emailClaim":"email","subjectClaim":"sub"');
     expect(smoke).toContain(
@@ -125,6 +126,22 @@ describe("local Docker integration smoke", () => {
     expect(smoke).toContain('BROKER_ISSUER="${BROKER_ISSUER_INPUT%/}"');
     expect(smoke).toContain("MCP_AUTHORIZATION_ISSUER=$BROKER_ISSUER_INPUT");
     expect(smoke).toContain("broker-journey-client.ts");
+    expect(smoke).toContain("task-tool-refusal-client.ts");
+    expect(smoke).toContain("provider-fixture.ts");
+    expect(smoke).toContain("GITHUB_FIXTURE_BASE_URL");
+    expect(smoke).toContain('FIXTURE_GITHUB_SCOPES="$GITHUB_OAUTH_SCOPES"');
+    expect(smoke).toContain("GITHUB_OAUTH_SCOPES=$GITHUB_OAUTH_SCOPES");
+    expect(smoke).toContain('--provider-fixture-url "$GITHUB_FIXTURE_BASE_URL"');
+    const refusalClient = await readFile("scripts/fixtures/task-tool-refusal-client.ts", "utf8");
+    const providerFixture = await readFile("scripts/fixtures/provider-fixture.ts", "utf8");
+    expect(refusalClient).toContain('const APPROVED_TOOL = "list_commits"');
+    expect(refusalClient).toContain('const DENIED_TOOL = "actions_get"');
+    expect(refusalClient).toContain('error === "task_tool_not_approved"');
+    expect(refusalClient).toContain("deniedPayload.error?.code === -32603");
+    expect(refusalClient).toContain('includes("Fixture commits")');
+    expect(refusalClient).toContain("providerCalls.tools.length !== 1");
+    expect(providerFixture).toContain('url.pathname === "/github-mcp/calls"');
+    expect(providerFixture).toContain('name: "list_commits"');
     expect(await readFile("scripts/fixtures/broker-journey-client.ts", "utf8")).toContain(
       '"mail" in claims || "oid" in claims',
     );
@@ -205,6 +222,8 @@ describe("local Docker integration smoke", () => {
     expect(override).toContain("gateway/agentgateway/local-github-smoke.yaml");
     expect(override).toContain("host.docker.internal:host-gateway");
     expect(override).toContain("HOP1_ISSUERS_JSON: ${GITHUB_SMOKE_HOP1_ISSUERS_JSON}");
+    expect(override).toContain("GITHUB_MCP_UPSTREAM_URL: http://host.docker.internal");
+    expect(override).toContain("GITHUB_OAUTH_TOKEN_URL: http://host.docker.internal");
     expect(config).toContain("name: google");
     expect(config).toContain("name: github");
     expect(config).toContain("host: http://github-wrapper:8080/mcp");
