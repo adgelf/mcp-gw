@@ -93,6 +93,14 @@
 {{- fail (printf "wrapper toolPrefix %s conflicts with an enabled built-in backend" $wrapper.toolPrefix) }}
 {{- end }}
 {{- $wrapperPrefixes = append $wrapperPrefixes $wrapper.toolPrefix }}
+{{- $catalog := $wrapper.catalog }}
+{{- $catalogPreset := $catalog.preset | default "" }}
+{{- $jiraPreset := has $catalogPreset (list "jira" "jira-read-only") }}
+{{- if $jiraPreset }}
+{{- if or (ne $wrapper.toolPrefix "jira") (ne $wrapper.credential.mode "per_user_oauth") (ne ($wrapper.credential.providerId | default "") "jira") (ne $wrapper.upstream.transport "http") (ne ($wrapper.upstream.url | default "") "https://mcp.atlassian.com/v2/mcp?tools=all") }}
+{{- fail (printf "wrappers[%d] Jira catalog preset requires toolPrefix jira, OAuth providerId jira, and the Atlassian v2 tools=all upstream" $index) }}
+{{- end }}
+{{- end }}
 {{- with $wrapper.sessions }}
 {{- if and .maxTotal .maxPerPrincipal (gt (int .maxPerPrincipal) (int .maxTotal)) }}
 {{- fail (printf "wrappers[%d] sessions.maxPerPrincipal must not exceed sessions.maxTotal" $index) }}
@@ -106,8 +114,8 @@
 {{- else if and (ne $wrapper.credential.mode "none") (not $wrapper.upstream.credentialEnv) }}
 {{- fail (printf "wrappers[%d] credentialed stdio upstream requires upstream.credentialEnv" $index) }}
 {{- end }}
-{{- range $tool := $wrapper.catalog.tools }}
-{{- $exposedToolName := printf "%s_%s" $wrapper.toolPrefix $tool.name }}
+{{- range $tool := ($catalog.tools | default (list)) }}
+{{- $exposedToolName := printf "%s_%s" $wrapper.toolPrefix ($tool.alias | default $tool.name) }}
 {{- if has $exposedToolName $wrapperToolNames }}
 {{- fail (printf "generic wrapper exposed tool name %s must be unique" $exposedToolName) }}
 {{- end }}
@@ -122,6 +130,14 @@
 {{- fail "wrappers OAuth providerId values must be unique" }}
 {{- end }}
 {{- $wrapperProviderIds = append $wrapperProviderIds $providerId }}
+{{- if eq ($wrapper.credential.identity.mode | default "verified_email") "atlassian_jira_asserted_email" }}
+{{- if ne $providerId "jira" }}
+{{- fail (printf "wrappers[%d] atlassian_jira_asserted_email requires OAuth providerId jira" $index) }}
+{{- end }}
+{{- if ne $wrapper.credential.userInfoUrl "https://api.atlassian.com/oauth/token/accessible-resources" }}
+{{- fail (printf "wrappers[%d] atlassian_jira_asserted_email requires the pinned Atlassian accessible-resources userInfoUrl" $index) }}
+{{- end }}
+{{- end }}
 {{- $expectedCallbackPath := printf "/oauth/%s/callback" $providerId }}
 {{- $callbackUrl := urlParse $wrapper.credential.redirectUri }}
 {{- if or (ne $callbackUrl.path $expectedCallbackPath) $callbackUrl.query $callbackUrl.fragment $callbackUrl.userinfo }}
@@ -133,10 +149,24 @@
 {{- fail (printf "wrappers[%d] OAuth provider URLs must not contain credentials or fragments" $index) }}
 {{- end }}
 {{- end }}
-{{- range $tool := $wrapper.catalog.tools }}
+{{- if $jiraPreset }}
+{{- $requiredScopes := list "read:jira:agent-interface" "search:jira:agent-interface" }}
+{{- if eq $catalogPreset "jira" }}
+{{- $requiredScopes = append $requiredScopes "write:jira:agent-interface" }}
+{{- else if has "write:jira:agent-interface" $wrapper.credential.scopes }}
+{{- fail "Jira jira-read-only preset must not request OAuth consent scope write:jira:agent-interface" }}
+{{- end }}
+{{- range $scope := $requiredScopes }}
+{{- if not (has $scope $wrapper.credential.scopes) }}
+{{- fail (printf "wrappers[%d] Jira %s preset requires OAuth consent scope %s" $index $catalogPreset $scope) }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- range $tool := $catalog.tools }}
 {{- range $scope := $tool.grants.scopes }}
 {{- if not (has $scope $wrapper.credential.scopes) }}
 {{- fail (printf "wrappers[%d] catalog scope %s is absent from OAuth consent scopes" $index $scope) }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -171,6 +201,9 @@
 {{- end }}
 {{- if and (eq $wrapper.credential.mode "per_user_oauth") (not $.Values.connectionLifecycle.enabled) }}
 {{- fail "enabled per-user OAuth wrappers require connectionLifecycle.enabled=true and an allowed callback ingress caller" }}
+{{- end }}
+{{- if and $jiraPreset (not $.Values.oauthMigrations.enabled) }}
+{{- fail "Jira catalog presets require oauthMigrations.enabled=true" }}
 {{- end }}
 {{- $secretKeys := $wrapperSecretRef.envKeys | default (list) }}
 {{- $extraEnvNames := list }}

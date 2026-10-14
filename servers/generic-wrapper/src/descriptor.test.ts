@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   parseGenericToolCatalog,
+  parseGenericToolDecisions,
   parseGenericWrapperDescriptor,
   validateGenericWrapperConfiguration,
 } from "./descriptor";
@@ -192,6 +193,89 @@ describe("generic wrapper descriptor", () => {
     ).toThrow("emailVerifiedField");
   });
 
+  test("accepts the exact loopback OAuth callback used by local provider development", () => {
+    const parsed = parseGenericWrapperDescriptor({
+      ...baseDescriptor,
+      lifecycleRoutes: true,
+      credential: {
+        mode: "per_user_oauth",
+        providerId: "jira",
+        authorizationUrl: "https://auth.atlassian.com/authorize",
+        tokenUrl: "https://auth.atlassian.com/oauth/token",
+        userInfoUrl: "https://api.atlassian.com/oauth/token/accessible-resources",
+        redirectUri: "http://127.0.0.1:28080/oauth/jira/callback",
+        scopes: ["read:jira-user", "read:jira:agent-interface", "offline_access"],
+        clientIdEnv: "JIRA_OAUTH_CLIENT_ID",
+        clientSecretEnv: "JIRA_OAUTH_CLIENT_SECRET",
+        encryptionKeyEnv: "JIRA_TOKEN_ENCRYPTION_KEY",
+        tokenStoreDsnEnv: "TOKEN_STORE_DSN",
+        identity: {
+          mode: "atlassian_jira_asserted_email",
+          siteUrl: "https://example.atlassian.net",
+        },
+        tokenEndpointAuthMethod: "client_secret_post",
+      },
+    });
+
+    expect(parsed.credential).toMatchObject({
+      providerId: "jira",
+      redirectUri: "http://127.0.0.1:28080/oauth/jira/callback",
+      identity: {
+        mode: "atlassian_jira_asserted_email",
+        siteUrl: "https://example.atlassian.net",
+      },
+    });
+    expect(() =>
+      parseGenericWrapperDescriptor({
+        ...baseDescriptor,
+        lifecycleRoutes: true,
+        credential: {
+          ...parsed.credential,
+          redirectUri: "http://localhost:28080/oauth/jira/callback",
+        },
+      }),
+    ).toThrow("explicit loopback HTTP");
+  });
+
+  test("pins the Atlassian asserted-email mode to provider jira and its first-party resource API", () => {
+    const credential = {
+      mode: "per_user_oauth",
+      providerId: "search-provider",
+      authorizationUrl: "https://auth.atlassian.com/authorize",
+      tokenUrl: "https://auth.atlassian.com/oauth/token",
+      userInfoUrl: "https://identity.example.com/resources",
+      redirectUri: "https://gateway.example.com/oauth/search-provider/callback",
+      scopes: ["read:jira-user"],
+      clientIdEnv: "OAUTH_CLIENT_ID",
+      clientSecretEnv: "OAUTH_CLIENT_SECRET",
+      encryptionKeyEnv: "OAUTH_TOKEN_ENCRYPTION_KEY",
+      tokenStoreDsnEnv: "TOKEN_STORE_DSN",
+      identity: {
+        mode: "atlassian_jira_asserted_email",
+        siteUrl: "https://example.atlassian.net",
+      },
+    };
+
+    expect(() =>
+      parseGenericWrapperDescriptor({
+        ...baseDescriptor,
+        lifecycleRoutes: true,
+        credential,
+      }),
+    ).toThrow("providerId jira");
+    expect(() =>
+      parseGenericWrapperDescriptor({
+        ...baseDescriptor,
+        lifecycleRoutes: true,
+        credential: {
+          ...credential,
+          providerId: "jira",
+          redirectUri: "https://gateway.example.com/oauth/jira/callback",
+        },
+      }),
+    ).toThrow("accessible-resources");
+  });
+
   test("requires an explicit credential environment for credentialed stdio", () => {
     const descriptor = parseGenericWrapperDescriptor({
       ...baseDescriptor,
@@ -263,6 +347,81 @@ describe("generic wrapper catalog", () => {
       operation: "search.query",
       scopes: ["search.read"],
     });
+  });
+
+  test("uses a stable alias without changing the upstream tool name", () => {
+    const catalog = parseGenericToolCatalog(
+      {
+        schemaVersion: "mcp-gateway.generic-catalog/v1",
+        catalogId: "jira@captured",
+        tools: [
+          {
+            name: "searchJiraIssuesUsingJql",
+            alias: "search_issues",
+            description: "Search Jira issues with JQL.",
+            inputSchema: { type: "object" },
+            annotations: { readOnlyHint: true },
+            grants: {
+              actionClass: "read",
+              operation: "jira.issue.search",
+              scopes: ["search:jira:agent-interface"],
+            },
+          },
+        ],
+      },
+      "jira",
+    );
+
+    expect(catalog.tools[0]).toMatchObject({
+      upstreamName: "searchJiraIssuesUsingJql",
+      exposedName: "jira_search_issues",
+    });
+  });
+
+  test("parses live decisions without vendor descriptions or schemas", () => {
+    const decisions = parseGenericToolDecisions(
+      {
+        schemaVersion: "mcp-gateway.generic-tool-decisions/v1",
+        catalogId: "provider-live",
+        tools: [
+          {
+            name: "getIssue",
+            disposition: "include",
+            alias: "get_issue",
+            actionClass: "read",
+            operation: "jira.issue.get",
+            scopes: ["read:jira:agent-interface"],
+          },
+          { name: "deleteIssue", disposition: "exclude", reason: "delete" },
+          {
+            name: "editIssue",
+            disposition: "include",
+            alias: "edit_issue",
+            actionClass: "write",
+            operation: "jira.issue.edit",
+            scopes: ["write:jira:agent-interface"],
+          },
+        ],
+      },
+      "jira",
+      { actionClasses: ["read"] },
+    );
+
+    expect(decisions.mode).toBe("live");
+    expect(decisions.decisions).toHaveLength(3);
+    expect(decisions.tools).toEqual([
+      {
+        upstreamName: "getIssue",
+        exposedName: "jira_get_issue",
+        alias: "get_issue",
+        disposition: "include",
+        grants: {
+          actionClass: "read",
+          operation: "jira.issue.get",
+          scopes: ["read:jira:agent-interface"],
+        },
+      },
+    ]);
   });
 
   test("rejects duplicate exposed names and unclassified tools", () => {

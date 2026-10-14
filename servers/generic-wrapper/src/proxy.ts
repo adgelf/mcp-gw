@@ -9,11 +9,15 @@ import {
   type Hop1Identity,
 } from "../../../shared/identity/hop1";
 import { AllowAllPolicy, type ToolPolicy } from "../../../shared/policy/policy";
+import { listUpstreamCatalog, type CapturedUpstreamTool } from "./catalog-capture";
 import type { GenericUpstreamCredential } from "./credentials";
-import type {
-  GenericCatalogTool,
-  GenericToolCatalog,
-  GenericWrapperDescriptor,
+import {
+  isLiveToolCatalog,
+  type GenericCatalogTool,
+  type GenericGovernedTool,
+  type GenericIncludedToolDecision,
+  type GenericToolSource,
+  type GenericWrapperDescriptor,
 } from "./descriptor";
 import type { GenericUpstreamTransport } from "./transport";
 
@@ -27,11 +31,19 @@ export interface ResolveGenericCredentialRequest {
 
 export interface CreateGenericMcpProxyHandlerOptions {
   descriptor: GenericWrapperDescriptor;
-  catalog: GenericToolCatalog;
+  catalog: GenericToolSource;
   authenticate(token: string): Promise<Hop1Identity>;
   resolveCredential(
     request: ResolveGenericCredentialRequest,
   ): Promise<GenericUpstreamCredential | null>;
+  recoverCredential?(
+    request: ResolveGenericCredentialRequest,
+    rejectedCredential: string,
+  ): Promise<GenericUpstreamCredential | null>;
+  validateCredential?(
+    request: ResolveGenericCredentialRequest,
+    credential: string,
+  ): Promise<"valid" | "invalid" | "unavailable">;
   transport: GenericUpstreamTransport;
   policy?: ToolPolicy;
   audit?: AuditSink;
@@ -146,6 +158,11 @@ export function createGenericMcpProxyHandler(
       return new Response(null, { status: 202 });
     }
     if (message.method === "tools/list") {
+      if (isLiveToolCatalog(options.catalog)) {
+        const invalidSession = validateRequestSession(options.transport, request, identity);
+        if (invalidSession) return invalidSession;
+        return liveToolsList(options, request, message.id, identity, hop1Token);
+      }
       return mcpResult(message.id, {
         tools: [
           ...oauthToolDefinitions(options),
@@ -180,6 +197,9 @@ export function createGenericMcpProxyHandler(
         `Unsupported MCP tool: ${message.toolName ?? "<missing>"}`,
       );
     }
+    if (tool) {
+      message.arguments = effectiveToolArguments(options.descriptor, message.arguments);
+    }
     if (oauthTool && options.oauth) {
       const decision = await policy.decide({
         principal: identity.email,
@@ -187,7 +207,7 @@ export function createGenericMcpProxyHandler(
         tool: message.toolName ?? "",
         operation: `${options.descriptor.name}.oauth.${oauthTool}`,
         service: options.descriptor.name,
-        actionClass: oauthTool === "status" ? "read" : "write",
+        actionClass: "read",
         scopes: [],
         args: message.arguments,
       });
@@ -289,7 +309,9 @@ export function createGenericMcpProxyHandler(
 
     try {
       const scopes = tool?.grants.scopes ?? [];
-      const credential = await options.resolveCredential({ identity, hop1Token, scopes });
+      const credentialRequest = { identity, hop1Token, scopes };
+      const canAutomaticallyReplay = tool?.grants.actionClass === "read";
+      let credential = await options.resolveCredential(credentialRequest);
       if (!credential && options.requireCredential) {
         await emitSafely(options.audit, {
           ts: new Date().toISOString(),
@@ -317,14 +339,138 @@ export function createGenericMcpProxyHandler(
           },
         });
       }
-      const upstreamBody = tool ? rewriteToolName(body, tool.upstreamName) : body;
-      const upstream = await options.transport.send({
+      const upstreamBody = tool
+        ? rewriteToolCall(body, tool.upstreamName, message.arguments)
+        : body;
+      let upstream = await options.transport.send({
         incomingRequest: request,
         body: upstreamBody,
         credential,
         principalKey: principalKey(identity),
       });
-      const responseBody = await readBoundedText(upstream, MAX_UPSTREAM_RESPONSE_BYTES);
+      let responseBody = await readBoundedText(upstream, MAX_UPSTREAM_RESPONSE_BYTES);
+      if (isJiraProvider(options.descriptor)) {
+        if (upstream.status === 401 && credential?.rawValue && options.recoverCredential) {
+          const replacement = await options.recoverCredential(
+            credentialRequest,
+            credential.rawValue,
+          );
+          if (replacement) {
+            credential = replacement;
+            if (!canAutomaticallyReplay) {
+              await emitProviderFailureAudit(
+                options.audit,
+                identity,
+                tool,
+                message.arguments,
+                started,
+                "provider_retry_required",
+              );
+              return providerFailure(
+                message.id,
+                "provider_retry_required",
+                "Provider credential was renewed; retry the request",
+                options,
+              );
+            }
+            upstream = await options.transport.send({
+              incomingRequest: request,
+              body: upstreamBody,
+              credential,
+              principalKey: principalKey(identity),
+            });
+            responseBody = await readBoundedText(upstream, MAX_UPSTREAM_RESPONSE_BYTES);
+          }
+        }
+        let opaqueFailure = atlassianOpaqueFailure(responseBody);
+        if (opaqueFailure && credential?.rawValue && options.validateCredential) {
+          let validation: "valid" | "invalid" | "unavailable" = "unavailable";
+          try {
+            validation = await options.validateCredential(credentialRequest, credential.rawValue);
+          } catch {
+            validation = "unavailable";
+          }
+          if (validation === "invalid" && options.recoverCredential) {
+            const replacement = await options.recoverCredential(
+              credentialRequest,
+              credential.rawValue,
+            );
+            if (replacement) {
+              credential = replacement;
+              if (!canAutomaticallyReplay) {
+                await emitProviderFailureAudit(
+                  options.audit,
+                  identity,
+                  tool,
+                  message.arguments,
+                  started,
+                  "provider_retry_required",
+                );
+                return providerFailure(
+                  message.id,
+                  "provider_retry_required",
+                  "Provider credential was renewed; retry the request",
+                  options,
+                );
+              }
+              upstream = await options.transport.send({
+                incomingRequest: request,
+                body: upstreamBody,
+                credential,
+                principalKey: principalKey(identity),
+              });
+              responseBody = await readBoundedText(upstream, MAX_UPSTREAM_RESPONSE_BYTES);
+              opaqueFailure = atlassianOpaqueFailure(responseBody);
+            }
+          }
+          if (opaqueFailure) {
+            const failure =
+              validation === "invalid"
+                ? {
+                    error: "provider_oauth_required",
+                    message: "Provider authorization is required",
+                  }
+                : validation === "valid" && opaqueFailure === "access_verification"
+                  ? {
+                      error: "provider_permission_denied",
+                      message: "Provider permission was denied",
+                    }
+                  : {
+                      error: "provider_unavailable",
+                      message: "Provider is temporarily unavailable",
+                    };
+            await emitProviderFailureAudit(
+              options.audit,
+              identity,
+              tool,
+              message.arguments,
+              started,
+              failure.error,
+            );
+            return providerFailure(message.id, failure.error, failure.message, options);
+          }
+        }
+        const failure = jiraHttpFailure(upstream);
+        if (failure) {
+          await emitProviderFailureAudit(
+            options.audit,
+            identity,
+            tool,
+            message.arguments,
+            started,
+            failure.error,
+          );
+          const mapped = providerFailure(
+            message.id,
+            failure.error,
+            failure.message,
+            options,
+            failure.retryAfter,
+          );
+          if (failure.retryAfter) mapped.headers.set("retry-after", failure.retryAfter);
+          return mapped;
+        }
+      }
       if (tool) {
         await emitSafely(options.audit, {
           ts: new Date().toISOString(),
@@ -436,10 +582,129 @@ function publicToolDefinition(tool: GenericCatalogTool): Record<string, unknown>
   };
 }
 
-function rewriteToolName(body: string, upstreamName: string): string {
+async function liveToolsList(
+  options: CreateGenericMcpProxyHandlerOptions,
+  request: Request,
+  id: JsonRpcId,
+  identity: Hop1Identity,
+  hop1Token: string,
+): Promise<Response> {
+  if (!isLiveToolCatalog(options.catalog)) {
+    throw new Error("liveToolsList requires a live tool-decisions catalog");
+  }
+  const helpers = oauthToolDefinitions(options);
+  let credential: GenericUpstreamCredential | null;
+  try {
+    credential = await options.resolveCredential({ identity, hop1Token, scopes: [] });
+  } catch {
+    return liveCatalogUnavailable(id, helpers, "Upstream tool discovery is unavailable");
+  }
+  if (!credential) {
+    return liveCatalogUnavailable(id, helpers, "Provider authorization is required", {
+      connectionHelper: `${options.descriptor.toolPrefix}_oauth_start`,
+    });
+  }
+  try {
+    const upstream = await listUpstreamCatalog({
+      transport: options.transport,
+      incomingRequest: request,
+      credential,
+      principalKey: principalKey(identity),
+    });
+    const decisions = new Map(
+      options.catalog.tools.map((decision) => [decision.upstreamName, decision]),
+    );
+    const tools = upstream.tools.flatMap((tool) => {
+      const decision = decisions.get(tool.name);
+      return decision ? [publicLiveToolDefinition(options.descriptor, decision, tool)] : [];
+    });
+    return mcpResult(id, { tools: [...helpers, ...tools] });
+  } catch {
+    return liveCatalogUnavailable(id, helpers, "Upstream tool discovery is unavailable");
+  }
+}
+
+function liveCatalogUnavailable(
+  id: JsonRpcId,
+  tools: Record<string, unknown>[],
+  message: string,
+  details: Record<string, unknown> = {},
+): Response {
+  return mcpResult(id, {
+    tools,
+    _meta: {
+      "mcp-gw/catalog": {
+        status: "unavailable",
+        error: message,
+        ...details,
+      },
+    },
+  });
+}
+
+function publicLiveToolDefinition(
+  descriptor: GenericWrapperDescriptor,
+  decision: GenericIncludedToolDecision,
+  upstream: CapturedUpstreamTool,
+): Record<string, unknown> {
+  if (typeof upstream.description !== "string" || upstream.description.length === 0) {
+    throw new Error(`Upstream tool ${upstream.name} has no description`);
+  }
+  if (!isRecord(upstream.inputSchema)) {
+    throw new Error(`Upstream tool ${upstream.name} has no input schema`);
+  }
+  return {
+    name: decision.exposedName,
+    description: upstream.description,
+    inputSchema: publicLiveInputSchema(descriptor, upstream.inputSchema),
+    annotations: {
+      readOnlyHint: decision.grants.actionClass === "read",
+      ...(decision.grants.actionClass === "destructive" ? { destructiveHint: true } : {}),
+    },
+  };
+}
+
+function publicLiveInputSchema(
+  descriptor: GenericWrapperDescriptor,
+  inputSchema: Record<string, unknown>,
+): Record<string, unknown> {
+  const schema = structuredClone(inputSchema);
+  if (!isJiraProvider(descriptor)) return schema;
+  if (isRecord(schema.properties)) delete schema.properties.cloudId;
+  if (Array.isArray(schema.required)) {
+    const required = schema.required.filter((name) => name !== "cloudId");
+    if (required.length > 0) schema.required = required;
+    else delete schema.required;
+  }
+  return schema;
+}
+
+function rewriteToolCall(
+  body: string,
+  upstreamName: string,
+  args: Record<string, unknown>,
+): string {
   const value = JSON.parse(body) as Record<string, unknown>;
   const params = isRecord(value.params) ? value.params : {};
-  return JSON.stringify({ ...value, params: { ...params, name: upstreamName } });
+  return JSON.stringify({
+    ...value,
+    params: { ...params, name: upstreamName, arguments: args },
+  });
+}
+
+function effectiveToolArguments(
+  descriptor: GenericWrapperDescriptor,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const credential = descriptor.credential;
+  if (
+    credential.mode === "per_user_oauth" &&
+    credential.providerId === "jira" &&
+    credential.identity.mode === "atlassian_jira_asserted_email"
+  ) {
+    return { ...args, cloudId: credential.identity.siteUrl };
+  }
+  return args;
 }
 
 function bearerToken(request: Request): string | undefined {
@@ -456,6 +721,112 @@ function forwardedResponseHeaders(response: Response): Headers {
     if (value) headers.set(name, value);
   }
   return headers;
+}
+
+function isJiraProvider(descriptor: GenericWrapperDescriptor): boolean {
+  return (
+    descriptor.credential.mode === "per_user_oauth" && descriptor.credential.providerId === "jira"
+  );
+}
+
+function atlassianOpaqueFailure(body: string): "transient" | "access_verification" | undefined {
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(body) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(envelope) || !isRecord(envelope.result) || envelope.result.isError !== true) {
+    return undefined;
+  }
+  const content = envelope.result.content;
+  if (!Array.isArray(content)) return undefined;
+  for (const item of content) {
+    if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") continue;
+    const normalized = item.text.trimStart().toLowerCase();
+    if (normalized.startsWith("we are having trouble completing this action")) return "transient";
+    if (normalized.startsWith("we couldn't verify your access")) return "access_verification";
+  }
+  return undefined;
+}
+
+function jiraHttpFailure(
+  response: Response,
+): { error: string; message: string; retryAfter?: string } | undefined {
+  if (response.status === 401) {
+    return {
+      error: "provider_oauth_required",
+      message: "Provider authorization is required",
+    };
+  }
+  if (response.status === 403) {
+    return {
+      error: "provider_permission_denied",
+      message: "Provider permission was denied",
+    };
+  }
+  if (response.status === 429) {
+    const retryAfter = response.headers.get("retry-after")?.trim();
+    return {
+      error: "provider_rate_limited",
+      message: "Provider rate limit exceeded",
+      ...(retryAfter ? { retryAfter } : {}),
+    };
+  }
+  if (response.status >= 500) {
+    return {
+      error: "provider_unavailable",
+      message: "Provider is temporarily unavailable",
+    };
+  }
+  return undefined;
+}
+
+async function emitProviderFailureAudit(
+  audit: AuditSink | undefined,
+  identity: Hop1Identity,
+  tool: GenericGovernedTool | undefined,
+  args: Record<string, unknown>,
+  started: number,
+  error: string,
+): Promise<void> {
+  if (!tool) return;
+  await emitSafely(audit, {
+    ts: new Date().toISOString(),
+    category: "tool_call",
+    principal: identity.email,
+    status: "error",
+    event: "provider_failure",
+    tool: tool.exposedName,
+    argDigest: digestArgs(args),
+    latencyMs: Date.now() - started,
+    error,
+  });
+}
+
+function providerFailure(
+  id: JsonRpcId,
+  error: string,
+  message: string,
+  options: CreateGenericMcpProxyHandlerOptions,
+  retryAfter?: string,
+): Response {
+  return mcpResult(id, {
+    isError: true,
+    content: [{ type: "text", text: message }],
+    structuredContent: {
+      error,
+      provider:
+        options.oauth?.providerId ??
+        (options.descriptor.credential.mode === "per_user_oauth"
+          ? options.descriptor.credential.providerId
+          : undefined),
+      ...(error === "provider_oauth_required"
+        ? { connectionHelper: `${options.descriptor.toolPrefix}_oauth_start` }
+        : {}),
+      ...(retryAfter ? { retryAfter } : {}),
+    },
+  });
 }
 
 function safeStreamingResponse(response: Response): Response {

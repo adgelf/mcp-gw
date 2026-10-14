@@ -1,6 +1,13 @@
 {{- range .Values.wrappers }}
 {{- if .enabled }}
 {{- $component := printf "generic-wrapper-%s" .name }}
+{{- $catalog := .catalog }}
+{{- $catalogPreset := $catalog.preset | default "" }}
+{{- $jiraPreset := has $catalogPreset (list "jira" "jira-read-only") }}
+{{- $catalogPath := "/etc/mcp-gw/catalog.yaml" }}
+{{- if $jiraPreset }}
+{{- $catalogPath = "/app/servers/generic-wrapper/catalog/jira/decisions.yaml" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,7 +20,11 @@ data:
     schemaVersion: mcp-gateway.generic-wrapper/v1
     name: {{ .name | quote }}
     toolPrefix: {{ .toolPrefix | quote }}
-    catalogPath: /etc/mcp-gw/catalog.yaml
+    catalogPath: {{ $catalogPath }}
+    {{- if eq $catalogPreset "jira-read-only" }}
+    catalogFilter:
+      actionClasses: [read]
+    {{- end }}
     lifecycleRoutes: {{ .lifecycleRoutes }}
     upstream:
 {{ omit .upstream "sidecar" | toYaml | nindent 6 }}
@@ -38,11 +49,13 @@ data:
     audit:
 {{ . | toYaml | nindent 6 }}
     {{- end }}
+  {{- if not $jiraPreset }}
   catalog.yaml: |
     schemaVersion: mcp-gateway.generic-catalog/v1
-    catalogId: {{ .catalog.catalogId | quote }}
+    catalogId: {{ $catalog.catalogId | quote }}
     tools:
-{{ .catalog.tools | toYaml | nindent 6 }}
+{{ $catalog.tools | toYaml | nindent 6 }}
+  {{- end }}
   {{- with .policy }}
   {{- with .yaml }}
   policy.yaml: |

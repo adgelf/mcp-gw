@@ -8,6 +8,29 @@ records the human-maintained compatibility summary.
 
 ## [Unreleased]
 
+### Added
+
+- Add an opt-in Jira Cloud provider backed by Atlassian's hosted Rovo MCP server, with per-user
+  OAuth, site-bound identity validation, local credential lifecycle controls, and `jira` and
+  `jira-read-only` Helm catalog presets.
+
+### Changed
+
+- Discover Jira tools live through the caller's credential and intersect every paginated response
+  with checked-in authority decisions. New or undecided upstream tools remain hidden, removed tools
+  disappear, and upstream discovery failures return only the Jira OAuth helpers without serving a
+  stale catalog.
+- Classify descriptor-driven generic-wrapper OAuth start and status helpers as read actions so
+  deny-by-default read-only policies can establish and inspect provider connections.
+
+### Upgrade Notes
+
+- Existing Google Workspace, GitHub, static generic-wrapper, Compose, and Helm values remain valid.
+  A policy that explicitly matched a descriptor-driven OAuth start helper as a write action must
+  match it as read after this release. Enabling Jira requires an Atlassian OAuth app, the documented
+  Secret values and exact callback route, and a migrated token store; no OAuth reconnect or new
+  value is required for existing providers.
+
 ## [0.5.7] - 2026-10-01
 
 ### Added

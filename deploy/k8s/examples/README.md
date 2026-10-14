@@ -29,6 +29,21 @@ Secret-backed API-key HTTP wrappers. The complete guide also covers per-user
 OAuth, exact callback routing, token-store migrations, and a public stdio
 reference server packaged in the wrapper image.
 
+`values-generic-oauth-existing-migrations.example.yaml` shows an enabled generic
+per-user OAuth wrapper whose operator runs the shared token-store migrations
+separately instead of enabling the chart migration hook. Jira presets require
+the hook because their example is a complete standalone deployment contract;
+custom wrappers remain compatible with externally managed migrations.
+
+The opt-in Jira provider uses that same generic-wrapper path. Its public OAuth
+surface is one exact `/oauth/jira/callback` route; keep every
+`/connections/jira/*` route private. Start from
+`values-jira.example.yaml` for the complete wrapper, Secret references,
+migration hook, and live decision-filtered catalog preset. Add
+`jira-provider-callback.example.yaml` when the environment uses Gateway API,
+and configure `connectionLifecycle.allowedCallers` with the observed data-plane
+proxy Namespace/Pod labels that deliver the route.
+
 To retain the existing db-mcp workload while adding HOP-1 validation, a pinned
 catalog, policy/audit hooks, and wrapper-owned sessions, start from
 `values-db-mcp-wrapped.example.yaml`. The direct topology remains the default;

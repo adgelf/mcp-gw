@@ -8,6 +8,8 @@ import {
   NONPUBLIC_SPECIAL_USE_IPV4_HOSTS,
 } from "../../shared/oauth/public-host-fixtures";
 import {
+  isLiveToolCatalog,
+  loadGenericToolSource,
   parseGenericToolCatalog,
   parseGenericWrapperDescriptor,
 } from "../../servers/generic-wrapper/src/descriptor";
@@ -563,6 +565,308 @@ describe("Kubernetes production chart", () => {
     expect(policy).toContain("app.kubernetes.io/name: public-gateway");
     expect(rendered).not.toContain("kind: HTTPRoute");
     expect(rendered).not.toContain("kind: Ingress");
+  });
+
+  test("renders a generic per-user OAuth wrapper when migrations are applied separately", () => {
+    const wrapper = genericOAuthWrapper("search-one", "search_one", "search-provider");
+    const rendered = helmTemplate([
+      ...genericWrapperBaseArgs(),
+      ...lifecycleCallerArgs(false),
+      "--set-json",
+      `wrappers=${JSON.stringify([wrapper])}`,
+    ]);
+
+    expect(rendered).toContain("mcp-gateway-generic-wrapper-search-one");
+    expect(rendered).not.toContain("kind: Job");
+  });
+
+  test("renders the Jira asserted-identity contract with a loopback callback and stable alias", () => {
+    const wrapper = genericOAuthWrapper("jira", "jira", "jira");
+    wrapper.credential = {
+      mode: "per_user_oauth",
+      providerId: "jira",
+      authorizationUrl: "https://auth.atlassian.com/authorize",
+      tokenUrl: "https://auth.atlassian.com/oauth/token",
+      userInfoUrl: "https://api.atlassian.com/oauth/token/accessible-resources",
+      redirectUri: "http://127.0.0.1:28080/oauth/jira/callback",
+      scopes: [
+        "read:jira-user",
+        "read:jira:agent-interface",
+        "write:jira:agent-interface",
+        "search:jira:agent-interface",
+        "offline_access",
+      ],
+      clientIdEnv: "JIRA_OAUTH_CLIENT_ID",
+      clientSecretEnv: "JIRA_OAUTH_CLIENT_SECRET",
+      encryptionKeyEnv: "JIRA_TOKEN_ENCRYPTION_KEY",
+      tokenStoreDsnEnv: "TOKEN_STORE_DSN",
+      identity: {
+        mode: "atlassian_jira_asserted_email",
+        siteUrl: "https://example.atlassian.net",
+      },
+      authorizationParams: { audience: "api.atlassian.com", prompt: "consent" },
+      tokenEndpointAuthMethod: "client_secret_post",
+    };
+    wrapper.secretRef = {
+      name: "jira-oauth",
+      envKeys: [
+        "JIRA_OAUTH_CLIENT_ID",
+        "JIRA_OAUTH_CLIENT_SECRET",
+        "JIRA_TOKEN_ENCRYPTION_KEY",
+        "TOKEN_STORE_DSN",
+      ],
+    };
+    wrapper.upstream = {
+      transport: "http",
+      url: "https://mcp.atlassian.com/v2/mcp?tools=all",
+    };
+    wrapper.catalog = { preset: "jira" };
+
+    const rendered = helmTemplate([
+      ...genericWrapperBaseArgs(),
+      ...lifecycleCallerArgs(),
+      "--set-json",
+      `wrappers=${JSON.stringify([wrapper])}`,
+    ]);
+    const component = "mcp-gateway-generic-wrapper-jira";
+    const configObject = parseAllDocuments(rendered)
+      .map((document) => document.toJSON() as Record<string, unknown>)
+      .find(
+        (resource) =>
+          resource.kind === "ConfigMap" &&
+          (resource.metadata as { name?: string } | undefined)?.name === `${component}-config`,
+      );
+    const data = configObject?.data as Record<string, string> | undefined;
+    const parsedDescriptor = parseGenericWrapperDescriptor(parse(data?.["descriptor.yaml"] ?? ""));
+    const parsedCatalog = loadGenericToolSource(
+      "servers/generic-wrapper/catalog/jira/decisions.yaml",
+      parsedDescriptor.toolPrefix,
+    );
+
+    expect(parsedDescriptor.credential).toMatchObject({
+      providerId: "jira",
+      redirectUri: "http://127.0.0.1:28080/oauth/jira/callback",
+      identity: { mode: "atlassian_jira_asserted_email" },
+    });
+    expect(isLiveToolCatalog(parsedCatalog)).toBeTrue();
+    expect(parsedCatalog.catalogId).toBe("atlassian-rovo-v2-live");
+    expect(parsedCatalog.tools).toHaveLength(41);
+    expect(parsedCatalog.tools).toContainEqual(
+      expect.objectContaining({
+        upstreamName: "getJiraIssue",
+        exposedName: "jira_get_issue",
+      }),
+    );
+    expect(parsedCatalog.tools).toContainEqual(
+      expect.objectContaining({
+        upstreamName: "manageJiraSprint",
+        exposedName: "jira_manage_sprint",
+        grants: expect.objectContaining({ actionClass: "write" }),
+      }),
+    );
+    expect(parsedCatalog.tools.map((tool) => tool.upstreamName)).not.toContain("search");
+    expect(parsedCatalog.tools.map((tool) => tool.upstreamName)).not.toContain(
+      "downloadJiraIssueAttachment",
+    );
+    expect(data).not.toHaveProperty("catalog.yaml");
+    expect(parsedDescriptor.catalogPath).toBe(
+      "/app/servers/generic-wrapper/catalog/jira/decisions.yaml",
+    );
+  });
+
+  test("pins the Jira catalog preset to the Jira provider and upstream", () => {
+    const wrapper = genericOAuthWrapper("jira", "other", "jira");
+    wrapper.upstream = {
+      transport: "http",
+      url: "https://mcp.atlassian.com/v2/mcp?tools=all",
+    };
+    wrapper.catalog = { preset: "jira" };
+
+    const result = helmTemplateResult([
+      ...genericWrapperBaseArgs(),
+      ...lifecycleCallerArgs(),
+      "--set-json",
+      `wrappers=${JSON.stringify([wrapper])}`,
+    ]);
+
+    assertHelmRejected(result);
+    expect(result.stderr.toString()).toContain(
+      "Jira catalog preset requires toolPrefix jira, OAuth providerId jira",
+    );
+  });
+
+  test("renders the Jira read-only preset without write authority or tools", () => {
+    const wrapper = genericOAuthWrapper("jira", "jira", "jira");
+    wrapper.credential = {
+      mode: "per_user_oauth",
+      providerId: "jira",
+      authorizationUrl: "https://auth.atlassian.com/authorize",
+      tokenUrl: "https://auth.atlassian.com/oauth/token",
+      userInfoUrl: "https://api.atlassian.com/oauth/token/accessible-resources",
+      redirectUri: "http://127.0.0.1:28080/oauth/jira/callback",
+      scopes: [
+        "read:jira-user",
+        "read:jira:agent-interface",
+        "search:jira:agent-interface",
+        "offline_access",
+      ],
+      clientIdEnv: "JIRA_OAUTH_CLIENT_ID",
+      clientSecretEnv: "JIRA_OAUTH_CLIENT_SECRET",
+      encryptionKeyEnv: "JIRA_TOKEN_ENCRYPTION_KEY",
+      tokenStoreDsnEnv: "TOKEN_STORE_DSN",
+      identity: {
+        mode: "atlassian_jira_asserted_email",
+        siteUrl: "https://example.atlassian.net",
+      },
+      authorizationParams: { audience: "api.atlassian.com", prompt: "consent" },
+      tokenEndpointAuthMethod: "client_secret_post",
+    };
+    wrapper.secretRef = {
+      name: "jira-oauth",
+      envKeys: [
+        "JIRA_OAUTH_CLIENT_ID",
+        "JIRA_OAUTH_CLIENT_SECRET",
+        "JIRA_TOKEN_ENCRYPTION_KEY",
+        "TOKEN_STORE_DSN",
+      ],
+    };
+    wrapper.upstream = {
+      transport: "http",
+      url: "https://mcp.atlassian.com/v2/mcp?tools=all",
+    };
+    wrapper.catalog = { preset: "jira-read-only" };
+
+    const rendered = helmTemplate([
+      ...genericWrapperBaseArgs(),
+      ...lifecycleCallerArgs(),
+      "--set-json",
+      `wrappers=${JSON.stringify([wrapper])}`,
+    ]);
+    const config = renderedResource(
+      rendered,
+      "ConfigMap",
+      "mcp-gateway-generic-wrapper-jira-config",
+    );
+    const configObject = parseAllDocuments(rendered)
+      .map((document) => document.toJSON() as Record<string, unknown>)
+      .find(
+        (resource) =>
+          resource.kind === "ConfigMap" &&
+          (resource.metadata as { name?: string } | undefined)?.name ===
+            "mcp-gateway-generic-wrapper-jira-config",
+      );
+    const data = configObject?.data as Record<string, string> | undefined;
+    const descriptor = parseGenericWrapperDescriptor(parse(data?.["descriptor.yaml"] ?? ""));
+    const catalog = loadGenericToolSource(
+      "servers/generic-wrapper/catalog/jira/decisions.yaml",
+      descriptor.toolPrefix,
+      descriptor.catalogFilter,
+    );
+
+    expect(descriptor.credential).toMatchObject({
+      scopes: [
+        "read:jira-user",
+        "read:jira:agent-interface",
+        "search:jira:agent-interface",
+        "offline_access",
+      ],
+    });
+    expect(isLiveToolCatalog(catalog)).toBeTrue();
+    expect(catalog.catalogId).toBe("atlassian-rovo-v2-live");
+    expect(catalog.tools).toHaveLength(27);
+    expect(catalog.tools.map((tool) => tool.exposedName)).toContain("jira_get_current_user");
+    expect(catalog.tools.map((tool) => tool.exposedName)).toContain("jira_search_issues");
+    expect(catalog.tools.map((tool) => tool.exposedName)).not.toContain("jira_create_issue");
+    expect(catalog.tools.map((tool) => tool.exposedName)).not.toContain("jira_edit_issue");
+    expect(config).not.toContain("write:jira:agent-interface");
+    expect(data).not.toHaveProperty("catalog.yaml");
+
+    const missingMigrations = helmTemplateResult([
+      ...genericWrapperBaseArgs(),
+      ...lifecycleCallerArgs(false),
+      "--set-json",
+      `wrappers=${JSON.stringify([wrapper])}`,
+    ]);
+    assertHelmRejected(missingMigrations);
+    expect(missingMigrations.stderr.toString()).toContain(
+      "Jira catalog presets require oauthMigrations.enabled=true",
+    );
+
+    const credential = wrapper.credential as { scopes: string[] };
+    credential.scopes.push("write:jira:agent-interface");
+    const excessiveAuthority = helmTemplateResult([
+      ...genericWrapperBaseArgs(),
+      ...lifecycleCallerArgs(),
+      "--set-json",
+      `wrappers=${JSON.stringify([wrapper])}`,
+    ]);
+    assertHelmRejected(excessiveAuthority);
+    expect(excessiveAuthority.stderr.toString()).toContain(
+      "Jira jira-read-only preset must not request OAuth consent scope write:jira:agent-interface",
+    );
+  });
+
+  test("renders the generic per-user OAuth example with externally applied migrations", () => {
+    const rendered = helmTemplate([
+      "--values",
+      "deploy/k8s/examples/values-generic-oauth-existing-migrations.example.yaml",
+    ]);
+
+    expect(rendered).toContain("mcp-gateway-generic-wrapper-hosted-search");
+    expect(rendered).not.toContain("kind: Job");
+  });
+
+  test("renders the opt-in Jira values example with the governed catalog", () => {
+    const rendered = helmTemplate(["--values", "deploy/k8s/examples/values-jira.example.yaml"]);
+    const config = renderedResource(
+      rendered,
+      "ConfigMap",
+      "mcp-gateway-generic-wrapper-jira-config",
+    );
+
+    expect(config).toContain(
+      "catalogPath: /app/servers/generic-wrapper/catalog/jira/decisions.yaml",
+    );
+    expect(config).toContain("actionClasses: [read]");
+    expect(config).not.toContain("catalog.yaml");
+    expect(config).not.toContain("write:jira:agent-interface");
+    expect(config).not.toMatch(/^\s+- name: search$/m);
+    expect(config).not.toContain("name: uploadAttachmentToJiraIssue");
+    expect(config).toContain("id: allow-read-only");
+    expect(config).toContain("actionClass: read");
+    expect(rendered).not.toContain("/connections/jira/");
+    expect(rendered).not.toContain("kind: HTTPRoute");
+    expect(rendered).not.toContain("kind: Ingress");
+  });
+
+  test("ships an exact-only Gateway API route for the Jira provider callback", async () => {
+    const example = await readExample("jira-provider-callback.example.yaml");
+    const [route] = parseAllDocuments(example).map(
+      (document) => document.toJSON() as Record<string, unknown>,
+    );
+    const rules = (route?.spec as { rules?: unknown[] } | undefined)?.rules;
+
+    expect(route?.kind).toBe("HTTPRoute");
+    expect(rules).toEqual([
+      {
+        matches: [
+          {
+            path: {
+              type: "Exact",
+              value: "/oauth/jira/callback",
+            },
+          },
+        ],
+        backendRefs: [
+          {
+            name: "mcp-gateway-generic-wrapper-jira",
+            port: 8080,
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(route)).not.toContain("/connections/jira/");
+    expect(JSON.stringify(route)).not.toContain("PathPrefix");
   });
 
   test("rejects an enabled AgentGateway without a resource or backend target", () => {
@@ -3043,7 +3347,7 @@ function stableManifestString(value: unknown, key?: string): string {
 function helmTemplateForRelease(releaseName: string, extraArgs: string[] = []): string {
   const result = helmTemplateResultForRelease(releaseName, extraArgs);
 
-  expect(result.exitCode).toBe(0);
+  expect(result.exitCode, result.stderr.toString()).toBe(0);
   return result.stdout.toString();
 }
 
@@ -3384,13 +3688,28 @@ function genericOAuthWrapper(
   };
 }
 
-function lifecycleCallerArgs(): string[] {
-  return [
+function lifecycleCallerArgs(includeMigrations = true): string[] {
+  const args = [
     "--set",
     "connectionLifecycle.enabled=true",
     "--set-json",
     'connectionLifecycle.allowedCallers=[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"gateway-system"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"public-gateway"}}}]',
   ];
+  if (includeMigrations) {
+    args.push(
+      "--set",
+      "oauthMigrations.enabled=true",
+      "--set-string",
+      "oauthMigrations.image.repository=ghcr.io/apelogic-ai/mcp-gw-generic-wrapper",
+      "--set-string",
+      `oauthMigrations.image.digest=sha256:${"e".repeat(64)}`,
+      "--set-string",
+      "oauthMigrations.secretKeyRef.name=generic-oauth",
+      "--set-string",
+      "oauthMigrations.secretKeyRef.key=TOKEN_STORE_DSN",
+    );
+  }
+  return args;
 }
 
 async function readExample(fileName: string): Promise<string> {
@@ -3407,10 +3726,13 @@ async function readAllExampleFiles(): Promise<Map<string, string>> {
     "values-enterprise-contract.example.yaml",
     "values-github-mcp.example.yaml",
     "values-generic-wrappers.example.yaml",
+    "values-generic-oauth-existing-migrations.example.yaml",
+    "values-jira.example.yaml",
     "values-db-mcp-wrapped.example.yaml",
     "values-google-policy.example.yaml",
     "values-customer-google-broker.example.yaml",
     "google-provider-callback.example.yaml",
+    "jira-provider-callback.example.yaml",
     "values-oauth-broker.example.yaml",
     "values-private-overlay.example.yaml",
     "values-production-bundle.example.yaml",

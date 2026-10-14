@@ -1,10 +1,16 @@
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
+import { OAUTH_PROVIDER_ID_PATTERN } from "../../../shared/oauth/store";
+
 import type { PolicyActionClass } from "../../../shared/policy/policy";
 
 export const GENERIC_WRAPPER_SCHEMA_VERSION = "mcp-gateway.generic-wrapper/v1" as const;
 export const GENERIC_CATALOG_SCHEMA_VERSION = "mcp-gateway.generic-catalog/v1" as const;
+export const GENERIC_TOOL_DECISIONS_SCHEMA_VERSION =
+  "mcp-gateway.generic-tool-decisions/v1" as const;
+export const ATLASSIAN_ACCESSIBLE_RESOURCES_URL =
+  "https://api.atlassian.com/oauth/token/accessible-resources" as const;
 
 export interface GenericServerInfo {
   name: string;
@@ -60,22 +66,31 @@ export interface GenericOAuthCredentialDescriptor {
   tokenStoreDsnEnv: string;
   header?: string;
   scheme?: string;
-  identity: {
-    idField: string;
-    emailField: string;
-    loginField?: string;
-    emailVerifiedField: string;
-  };
+  identity: GenericOAuthIdentityDescriptor;
   authorizationParams?: Record<string, string>;
   tokenEndpointAuthMethod?: "client_secret_basic" | "client_secret_post";
   timeoutMs?: number;
 }
+
+export type GenericOAuthIdentityDescriptor =
+  | {
+      mode?: "verified_email";
+      idField: string;
+      emailField: string;
+      loginField?: string;
+      emailVerifiedField: string;
+    }
+  | {
+      mode: "atlassian_jira_asserted_email";
+      siteUrl: string;
+    };
 
 export interface GenericWrapperDescriptor {
   schemaVersion: typeof GENERIC_WRAPPER_SCHEMA_VERSION;
   name: string;
   toolPrefix: string;
   catalogPath: string;
+  catalogFilter?: { actionClasses: PolicyActionClass[] };
   lifecycleRoutes: boolean;
   upstream: GenericUpstreamDescriptor;
   credential: GenericCredentialDescriptor;
@@ -91,13 +106,17 @@ export interface GenericToolGrant {
   scopes: string[];
 }
 
-export interface GenericCatalogTool {
+export interface GenericGovernedTool {
   exposedName: string;
   upstreamName: string;
+  alias?: string;
+  grants: GenericToolGrant;
+}
+
+export interface GenericCatalogTool extends GenericGovernedTool {
   description: string;
   inputSchema: Record<string, unknown>;
   annotations: { readOnlyHint: boolean; destructiveHint?: boolean };
-  grants: GenericToolGrant;
 }
 
 export interface GenericToolCatalog {
@@ -106,9 +125,32 @@ export interface GenericToolCatalog {
   tools: GenericCatalogTool[];
 }
 
+export interface GenericExcludedToolDecision {
+  upstreamName: string;
+  disposition: "exclude";
+  reason: string;
+}
+
+export interface GenericIncludedToolDecision extends GenericGovernedTool {
+  disposition: "include";
+}
+
+export type GenericToolDecision = GenericIncludedToolDecision | GenericExcludedToolDecision;
+
+export interface GenericLiveToolCatalog {
+  schemaVersion: typeof GENERIC_TOOL_DECISIONS_SCHEMA_VERSION;
+  catalogId: string;
+  mode: "live";
+  decisions: GenericToolDecision[];
+  tools: GenericIncludedToolDecision[];
+}
+
+export type GenericToolSource = GenericToolCatalog | GenericLiveToolCatalog;
+
 const NAME_PATTERN = /^[a-z][a-z0-9-]{1,62}$/;
 const TOOL_PREFIX_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,128}$/;
+const TOOL_ALIAS_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const ENV_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const HEADER_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const FIELD_PATH_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
@@ -128,6 +170,24 @@ export function loadGenericToolCatalog(path: string, toolPrefix: string): Generi
   return parseGenericToolCatalog(parseYaml(readFileSync(path, "utf8")), toolPrefix);
 }
 
+export function loadGenericToolSource(
+  path: string,
+  toolPrefix: string,
+  filter?: GenericWrapperDescriptor["catalogFilter"],
+): GenericToolSource {
+  const value: unknown = parseYaml(readFileSync(path, "utf8"));
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).schemaVersion === GENERIC_TOOL_DECISIONS_SCHEMA_VERSION
+  ) {
+    return parseGenericToolDecisions(value, toolPrefix, filter);
+  }
+  if (filter) throw new Error("catalogFilter requires a live tool-decisions catalog");
+  return parseGenericToolCatalog(value, toolPrefix);
+}
+
 export function parseGenericWrapperDescriptor(value: unknown): GenericWrapperDescriptor {
   const record = objectValue(value, "descriptor");
   assertAllowedFields(record, "descriptor", [
@@ -135,6 +195,7 @@ export function parseGenericWrapperDescriptor(value: unknown): GenericWrapperDes
     "name",
     "toolPrefix",
     "catalogPath",
+    "catalogFilter",
     "lifecycleRoutes",
     "upstream",
     "credential",
@@ -161,6 +222,7 @@ export function parseGenericWrapperDescriptor(value: unknown): GenericWrapperDes
     name,
     toolPrefix,
     catalogPath,
+    ...parseCatalogFilter(record.catalogFilter),
     lifecycleRoutes,
     upstream: parseUpstream(record.upstream),
     credential: parseCredential(credentialRecord),
@@ -198,9 +260,55 @@ export function parseGenericToolCatalog(value: unknown, toolPrefix: string): Gen
   };
 }
 
+export function parseGenericToolDecisions(
+  value: unknown,
+  toolPrefix: string,
+  filter?: GenericWrapperDescriptor["catalogFilter"],
+): GenericLiveToolCatalog {
+  patternString(toolPrefix, "toolPrefix", TOOL_PREFIX_PATTERN);
+  const record = objectValue(value, "decisions");
+  assertAllowedFields(record, "decisions", ["schemaVersion", "catalogId", "tools"]);
+  if (record.schemaVersion !== GENERIC_TOOL_DECISIONS_SCHEMA_VERSION) {
+    throw new Error(`decisions.schemaVersion must be ${GENERIC_TOOL_DECISIONS_SCHEMA_VERSION}`);
+  }
+  if (!Array.isArray(record.tools) || record.tools.length === 0) {
+    throw new Error("decisions.tools must be a non-empty array");
+  }
+  const upstreamNames = new Set<string>();
+  const exposedNames = new Set<string>();
+  const decisions = record.tools.map((value, index) => {
+    const decision = parseToolDecision(value, index, toolPrefix);
+    if (upstreamNames.has(decision.upstreamName)) {
+      throw new Error(`Duplicate tool decision: ${decision.upstreamName}`);
+    }
+    upstreamNames.add(decision.upstreamName);
+    if (decision.disposition === "include") {
+      if (exposedNames.has(decision.exposedName)) {
+        throw new Error(`Duplicate exposed tool decision: ${decision.exposedName}`);
+      }
+      exposedNames.add(decision.exposedName);
+    }
+    return decision;
+  });
+  const allowedClasses = filter ? new Set(filter.actionClasses) : undefined;
+  const tools = decisions.filter(
+    (decision): decision is GenericIncludedToolDecision =>
+      decision.disposition === "include" &&
+      (!allowedClasses || allowedClasses.has(decision.grants.actionClass)),
+  );
+  if (tools.length === 0) throw new Error("live tool decisions select no tools");
+  return {
+    schemaVersion: GENERIC_TOOL_DECISIONS_SCHEMA_VERSION,
+    catalogId: nonEmptyString(record.catalogId, "decisions.catalogId"),
+    mode: "live",
+    decisions,
+    tools,
+  };
+}
+
 export function validateGenericWrapperConfiguration(
   descriptor: GenericWrapperDescriptor,
-  catalog: GenericToolCatalog,
+  catalog: GenericToolSource,
 ): void {
   if (
     descriptor.upstream.transport === "stdio" &&
@@ -231,6 +339,10 @@ export function validateGenericWrapperConfiguration(
       }
     }
   }
+}
+
+export function isLiveToolCatalog(source: GenericToolSource): source is GenericLiveToolCatalog {
+  return source.schemaVersion === GENERIC_TOOL_DECISIONS_SCHEMA_VERSION;
 }
 
 function parseUpstream(value: unknown): GenericUpstreamDescriptor {
@@ -359,13 +471,7 @@ function parseOAuthCredential(record: Record<string, unknown>): GenericOAuthCred
     "tokenEndpointAuthMethod",
     "timeoutMs",
   ]);
-  const identity = objectValue(record.identity, "credential.identity");
-  assertAllowedFields(identity, "credential.identity", [
-    "idField",
-    "emailField",
-    "loginField",
-    "emailVerifiedField",
-  ]);
+  const identity = parseOAuthIdentity(record.identity);
   const authMethod = record.tokenEndpointAuthMethod;
   if (
     authMethod !== undefined &&
@@ -374,7 +480,25 @@ function parseOAuthCredential(record: Record<string, unknown>): GenericOAuthCred
   ) {
     throw new Error("credential.tokenEndpointAuthMethod is invalid");
   }
-  const providerId = patternString(record.providerId, "credential.providerId", NAME_PATTERN);
+  const providerId = patternString(
+    record.providerId,
+    "credential.providerId",
+    OAUTH_PROVIDER_ID_PATTERN,
+  );
+  if (identity.mode === "atlassian_jira_asserted_email" && providerId !== "jira") {
+    throw new Error(
+      "credential.identity mode atlassian_jira_asserted_email requires providerId jira",
+    );
+  }
+  const userInfoUrl = httpsUrl(record.userInfoUrl, "credential.userInfoUrl");
+  if (
+    identity.mode === "atlassian_jira_asserted_email" &&
+    userInfoUrl !== ATLASSIAN_ACCESSIBLE_RESOURCES_URL
+  ) {
+    throw new Error(
+      `credential.userInfoUrl must be the pinned Atlassian accessible-resources endpoint ${ATLASSIAN_ACCESSIBLE_RESOURCES_URL}`,
+    );
+  }
   const redirectUri = httpsOrLoopbackUrl(record.redirectUri, "credential.redirectUri");
   const parsedRedirect = new URL(redirectUri);
   const expectedCallbackPath = `/oauth/${providerId}/callback`;
@@ -392,7 +516,7 @@ function parseOAuthCredential(record: Record<string, unknown>): GenericOAuthCred
     providerId,
     authorizationUrl: httpsUrl(record.authorizationUrl, "credential.authorizationUrl"),
     tokenUrl: httpsUrl(record.tokenUrl, "credential.tokenUrl"),
-    userInfoUrl: httpsUrl(record.userInfoUrl, "credential.userInfoUrl"),
+    userInfoUrl,
     ...optionalUrlProperty(record.revocationUrl, "credential.revocationUrl", "revocationUrl"),
     redirectUri,
     scopes: requiredStringArray(record.scopes, "credential.scopes"),
@@ -418,25 +542,7 @@ function parseOAuthCredential(record: Record<string, unknown>): GenericOAuthCred
         : headerName(record.header, "credential.header"),
     scheme:
       record.scheme === undefined ? "Bearer" : nonEmptyString(record.scheme, "credential.scheme"),
-    identity: {
-      idField: patternString(identity.idField, "credential.identity.idField", FIELD_PATH_PATTERN),
-      emailField: patternString(
-        identity.emailField,
-        "credential.identity.emailField",
-        FIELD_PATH_PATTERN,
-      ),
-      ...optionalPatternProperty(
-        identity.loginField,
-        "credential.identity.loginField",
-        "loginField",
-        FIELD_PATH_PATTERN,
-      ),
-      emailVerifiedField: patternString(
-        identity.emailVerifiedField,
-        "credential.identity.emailVerifiedField",
-        FIELD_PATH_PATTERN,
-      ),
-    },
+    identity,
     ...(record.authorizationParams === undefined
       ? {}
       : {
@@ -450,17 +556,63 @@ function parseOAuthCredential(record: Record<string, unknown>): GenericOAuthCred
   };
 }
 
+function parseOAuthIdentity(value: unknown): GenericOAuthIdentityDescriptor {
+  const identity = objectValue(value, "credential.identity");
+  if (identity.mode === "atlassian_jira_asserted_email") {
+    assertAllowedFields(identity, "credential.identity", ["mode", "siteUrl"]);
+    return {
+      mode: "atlassian_jira_asserted_email",
+      siteUrl: httpsOrigin(identity.siteUrl, "credential.identity.siteUrl"),
+    };
+  }
+  if (identity.mode !== undefined && identity.mode !== "verified_email") {
+    throw new Error("credential.identity.mode is invalid");
+  }
+  assertAllowedFields(identity, "credential.identity", [
+    "mode",
+    "idField",
+    "emailField",
+    "loginField",
+    "emailVerifiedField",
+  ]);
+  return {
+    ...(identity.mode === "verified_email" ? { mode: "verified_email" as const } : {}),
+    idField: patternString(identity.idField, "credential.identity.idField", FIELD_PATH_PATTERN),
+    emailField: patternString(
+      identity.emailField,
+      "credential.identity.emailField",
+      FIELD_PATH_PATTERN,
+    ),
+    ...optionalPatternProperty(
+      identity.loginField,
+      "credential.identity.loginField",
+      "loginField",
+      FIELD_PATH_PATTERN,
+    ),
+    emailVerifiedField: patternString(
+      identity.emailVerifiedField,
+      "credential.identity.emailVerifiedField",
+      FIELD_PATH_PATTERN,
+    ),
+  };
+}
+
 function parseCatalogTool(value: unknown, index: number, prefix: string): GenericCatalogTool {
   const name = `catalog.tools[${String(index)}]`;
   const record = objectValue(value, name);
   assertAllowedFields(record, name, [
     "name",
+    "alias",
     "description",
     "inputSchema",
     "annotations",
     "grants",
   ]);
   const upstreamName = patternString(record.name, `${name}.name`, TOOL_NAME_PATTERN);
+  const alias =
+    record.alias === undefined
+      ? undefined
+      : patternString(record.alias, `${name}.alias`, TOOL_ALIAS_PATTERN);
   const annotations = objectValue(record.annotations, `${name}.annotations`);
   assertAllowedFields(annotations, `${name}.annotations`, ["readOnlyHint", "destructiveHint"]);
   const grants = objectValue(record.grants, `${name}.grants`);
@@ -471,7 +623,8 @@ function parseCatalogTool(value: unknown, index: number, prefix: string): Generi
   }
   return {
     upstreamName,
-    exposedName: `${prefix}_${upstreamName}`,
+    exposedName: `${prefix}_${alias ?? upstreamName}`,
+    ...(alias ? { alias } : {}),
     description: nonEmptyString(record.description, `${name}.description`),
     inputSchema: objectValue(record.inputSchema, `${name}.inputSchema`),
     annotations: {
@@ -499,6 +652,78 @@ function parseCatalogTool(value: unknown, index: number, prefix: string): Generi
           : requiredStringArray(grants.scopes, `${name}.grants.scopes`, true),
     },
   };
+}
+
+function parseToolDecision(value: unknown, index: number, prefix: string): GenericToolDecision {
+  const name = `decisions.tools[${String(index)}]`;
+  const record = objectValue(value, name);
+  const upstreamName = patternString(record.name, `${name}.name`, TOOL_NAME_PATTERN);
+  if (record.disposition === "exclude") {
+    assertAllowedFields(record, name, ["name", "disposition", "reason"]);
+    return {
+      upstreamName,
+      disposition: "exclude",
+      reason: nonEmptyString(record.reason, `${name}.reason`),
+    };
+  }
+  if (record.disposition !== "include") {
+    throw new Error(`${name}.disposition must be include or exclude`);
+  }
+  assertAllowedFields(record, name, [
+    "name",
+    "disposition",
+    "alias",
+    "actionClass",
+    "operation",
+    "scopes",
+  ]);
+  const alias = patternString(record.alias, `${name}.alias`, TOOL_ALIAS_PATTERN);
+  const actionClass = record.actionClass;
+  if (actionClass !== "read" && actionClass !== "write" && actionClass !== "destructive") {
+    throw new Error(`${name}.actionClass is invalid`);
+  }
+  return {
+    upstreamName,
+    exposedName: `${prefix}_${alias}`,
+    alias,
+    disposition: "include",
+    grants: {
+      actionClass,
+      ...optionalPatternProperty(
+        record.operation,
+        `${name}.operation`,
+        "operation",
+        OPERATION_PATTERN,
+      ),
+      scopes:
+        record.scopes === undefined
+          ? []
+          : requiredStringArray(record.scopes, `${name}.scopes`, true),
+    },
+  };
+}
+
+function parseCatalogFilter(
+  value: unknown,
+): Pick<GenericWrapperDescriptor, "catalogFilter"> | Record<string, never> {
+  if (value === undefined) return {};
+  const record = objectValue(value, "catalogFilter");
+  assertAllowedFields(record, "catalogFilter", ["actionClasses"]);
+  if (!Array.isArray(record.actionClasses) || record.actionClasses.length === 0) {
+    throw new Error("catalogFilter.actionClasses must be a non-empty array");
+  }
+  const actionClasses: PolicyActionClass[] = (record.actionClasses as unknown[]).map(
+    (entry, index): PolicyActionClass => {
+      if (entry !== "read" && entry !== "write" && entry !== "destructive") {
+        throw new Error(`catalogFilter.actionClasses[${String(index)}] is invalid`);
+      }
+      return entry;
+    },
+  );
+  if (new Set(actionClasses).size !== actionClasses.length) {
+    throw new Error("catalogFilter.actionClasses must not contain duplicates");
+  }
+  return { catalogFilter: { actionClasses } };
 }
 
 function parseServerInfo(value: unknown, name: string): GenericServerInfo {
@@ -640,6 +865,15 @@ function httpsUrl(value: unknown, name: string): string {
   const result = httpUrl(value, name);
   if (new URL(result).protocol !== "https:") throw new Error(`${name} must use HTTPS`);
   return result;
+}
+
+function httpsOrigin(value: unknown, name: string): string {
+  const result = httpsUrl(value, name);
+  const url = new URL(result);
+  if (url.pathname !== "/" || url.search || url.hash) {
+    throw new Error(`${name} must be an HTTPS origin without a path, query, or fragment`);
+  }
+  return url.origin;
 }
 
 function httpsOrLoopbackUrl(value: unknown, name: string): string {
