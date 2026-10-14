@@ -1,4 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import {
+  TASK_AUTHORITY_CLAIM,
+  taskAuthority,
+  taskClaims,
+  withTaskAuthority,
+} from "../../../../test/support/task-authority-fixture";
 
 import { InMemoryAuditSink } from "../../../../shared/audit/audit";
 import {
@@ -8,6 +15,7 @@ import {
 } from "../../../../shared/identity/hop1";
 import { GitHubOAuthError } from "../../../../shared/oauth/github";
 import type { ToolPolicy, ToolPolicyInput } from "../../../../shared/policy/policy";
+import { createAuthenticator } from "../../../../packages/wrapper-kit/src/authenticator";
 import {
   GITHUB_MCP_CATALOG_ID,
   GITHUB_MCP_TOOLS,
@@ -23,6 +31,514 @@ describe("GitHub MCP proxy wrapper", () => {
     email: "user@example.com",
     claims: {},
   };
+
+  test("lists and executes only exact Task-approved GitHub tool tuples", async () => {
+    let statusCalls = 0;
+    let tokenCalls = 0;
+    let policyCalls = 0;
+    let upstreamCalls = 0;
+    const taskIdentity: Hop1Identity = {
+      ...identity,
+      claims: withTaskAuthority({
+        ...taskAuthority,
+        tools: [{ provider: "github", resource: "get_file_contents", action: "read" }],
+      }),
+    };
+    const handler = createGithubMcpProxyHandler({
+      upstreamUrl: "http://github-mcp:8082/mcp",
+      governanceCatalogId: GITHUB_MCP_CATALOG_ID,
+      githubToolsets: ["repos"],
+      authenticate: () => Promise.resolve(taskIdentity),
+      taskToolAuthorization: {},
+      getOAuthStatus: () => {
+        statusCalls += 1;
+        return Promise.resolve({
+          connected: true,
+          scopesRequired: ["repo"],
+          scopesGranted: ["repo"],
+          missingScopes: [],
+        });
+      },
+      resolveGithubToken: () => {
+        tokenCalls += 1;
+        return Promise.resolve("provider-token");
+      },
+      policy: {
+        decide: () => {
+          policyCalls += 1;
+          return Promise.resolve({ kind: "allow" });
+        },
+      },
+      fetch: async (request) => {
+        upstreamCalls += 1;
+        const payload = (await request.json()) as { id: string };
+        return Response.json({ jsonrpc: "2.0", id: payload.id, result: { ok: true } });
+      },
+    });
+
+    const listed = await rpc(handler, {
+      jsonrpc: "2.0",
+      id: "list",
+      method: "tools/list",
+      params: {},
+    });
+    const names = (
+      (await listed.json()) as { result: { tools: { name: string }[] } }
+    ).result.tools.map((tool) => tool.name);
+    expect(names).toEqual(["github_oauth_status", "github_oauth_start", "get_file_contents"]);
+
+    expect(
+      await (
+        await rpc(handler, {
+          jsonrpc: "2.0",
+          id: "allowed",
+          method: "tools/call",
+          params: { name: "get_file_contents", arguments: {} },
+        })
+      ).json(),
+    ).toMatchObject({ result: { ok: true } });
+
+    for (const denied of ["list_commits", "create_branch"]) {
+      expect(
+        await (
+          await rpc(handler, {
+            jsonrpc: "2.0",
+            id: denied,
+            method: "tools/call",
+            params: { name: denied, arguments: {} },
+          })
+        ).json(),
+      ).toMatchObject({
+        result: {
+          isError: true,
+          content: [{ type: "text", text: "Tool is not approved for this Task" }],
+          structuredContent: { error: "task_tool_not_approved" },
+        },
+      });
+    }
+    expect(statusCalls).toBe(1);
+    expect(tokenCalls).toBe(1);
+    expect(policyCalls).toBe(1);
+    expect(upstreamCalls).toBe(1);
+  });
+
+  test("rejects JSON-RPC batch and non-object bodies before forwarding", async () => {
+    let upstreamCalls = 0;
+    const handler = createGithubMcpProxyHandler({
+      upstreamUrl: "http://github-mcp:8082/mcp",
+      authenticate: () => Promise.resolve(identity),
+      resolveGithubToken: () => Promise.resolve("provider-token"),
+      fetch: () => {
+        upstreamCalls += 1;
+        return Promise.resolve(new Response("{}"));
+      },
+    });
+
+    for (const body of [
+      JSON.stringify([
+        {
+          jsonrpc: "2.0",
+          id: "batch",
+          method: "tools/call",
+          params: { name: "get_file_contents", arguments: {} },
+        },
+      ]),
+      JSON.stringify("not-an-object"),
+      "{",
+    ]) {
+      const response = await handler(
+        new Request("http://wrapper/mcp", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer hop1-token",
+            "content-type": "application/json",
+          },
+          body,
+        }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request" },
+      });
+    }
+    expect(upstreamCalls).toBe(0);
+  });
+
+  test("restricted callers cannot reach non-tool MCP methods or transports", async () => {
+    let tokenCalls = 0;
+    let upstreamCalls = 0;
+    const taskIdentity: Hop1Identity = {
+      ...identity,
+      claims: withTaskAuthority({
+        ...taskAuthority,
+        tools: [{ provider: "github", resource: "get_file_contents", action: "read" }],
+      }),
+    };
+    const handler = createGithubMcpProxyHandler({
+      upstreamUrl: "http://github-mcp:8082/mcp",
+      authenticate: () => Promise.resolve(taskIdentity),
+      resolveGithubToken: () => {
+        tokenCalls += 1;
+        return Promise.resolve("provider-token");
+      },
+      fetch: () => {
+        upstreamCalls += 1;
+        return Promise.resolve(new Response("{}"));
+      },
+    });
+
+    for (const method of [
+      "resources/read",
+      "resources/list",
+      "resources/templates/list",
+      "prompts/list",
+      "prompts/get",
+      "completion/complete",
+      "vendor/custom",
+    ]) {
+      const response = await rpc(handler, { jsonrpc: "2.0", id: method, method, params: {} });
+      expect(await response.json()).toEqual({
+        jsonrpc: "2.0",
+        id: method,
+        error: { code: -32601, message: `Unsupported MCP method: ${method}` },
+      });
+    }
+
+    const malformedCall = await rpc(handler, {
+      jsonrpc: "2.0",
+      id: "malformed-call",
+      method: "tools/call",
+      params: {},
+    });
+    expect(await malformedCall.json()).toEqual({
+      jsonrpc: "2.0",
+      id: "malformed-call",
+      error: { code: -32600, message: "Invalid Request" },
+    });
+
+    for (const method of ["GET", "DELETE"]) {
+      const response = await handler(
+        new Request("http://wrapper/mcp", {
+          method,
+          headers: { authorization: "Bearer hop1-token" },
+        }),
+      );
+      expect(await response.json()).toEqual({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32601, message: `Unsupported MCP method: ${method}` },
+      });
+    }
+
+    expect(
+      await (await rpc(handler, { jsonrpc: "2.0", id: "ping", method: "ping", params: {} })).json(),
+    ).toEqual({ jsonrpc: "2.0", id: "ping", result: {} });
+    expect(
+      await rpc(handler, { jsonrpc: "2.0", method: "notifications/initialized" }),
+    ).toMatchObject({ status: 202 });
+    expect(tokenCalls).toBe(0);
+    expect(upstreamCalls).toBe(0);
+  });
+
+  test("keeps non-POST transport requests available to unrestricted callers", async () => {
+    const forwardedMethods: string[] = [];
+    const handler = createGithubMcpProxyHandler({
+      upstreamUrl: "http://github-mcp:8082/mcp",
+      authenticate: () => Promise.resolve(identity),
+      resolveGithubToken: () => Promise.resolve("provider-token"),
+      fetch: (request) => {
+        forwardedMethods.push(request.method);
+        return Promise.resolve(new Response(null, { status: 202 }));
+      },
+    });
+
+    for (const method of ["GET", "DELETE"]) {
+      const response = await handler(
+        new Request("http://wrapper/mcp", {
+          method,
+          headers: { authorization: "Bearer hop1-token" },
+        }),
+      );
+      expect(response.status).toBe(202);
+    }
+    expect(forwardedMethods).toEqual(["GET", "DELETE"]);
+  });
+
+  test("the purpose-bound status identity receives no MCP tools", async () => {
+    let providerEffects = 0;
+    const handler = createGithubMcpProxyHandler({
+      upstreamUrl: "http://github-mcp:8082/mcp",
+      authenticate: () =>
+        Promise.resolve({
+          ...identity,
+          claims: withTaskAuthority({
+            acting_as: "service_for_user",
+            service: ["ste", "ward-apiserver"].join(""),
+            purpose: "provider_connection_status",
+            tools: [{ provider: "github", resource: "provider-control", action: "status" }],
+            version: 3,
+          }),
+        }),
+      getOAuthStatus: () => {
+        providerEffects += 1;
+        return Promise.resolve({
+          connected: true,
+          scopesRequired: [],
+          scopesGranted: [],
+          missingScopes: [],
+        });
+      },
+      resolveGithubToken: () => {
+        providerEffects += 1;
+        return Promise.resolve("provider-token");
+      },
+      fetch: () => {
+        providerEffects += 1;
+        return Promise.resolve(new Response("{}"));
+      },
+    });
+
+    const listed = (await (
+      await rpc(handler, { jsonrpc: "2.0", id: "list", method: "tools/list", params: {} })
+    ).json()) as { result: { tools: unknown[] } };
+    expect(listed.result.tools).toEqual([]);
+
+    const denied = await rpc(handler, {
+      jsonrpc: "2.0",
+      id: "status-helper",
+      method: "tools/call",
+      params: { name: "github_oauth_status", arguments: {} },
+    });
+    expect(await denied.json()).toMatchObject({
+      result: {
+        isError: true,
+        structuredContent: { error: "task_tool_not_approved" },
+      },
+    });
+    expect(providerEffects).toBe(0);
+  });
+
+  test("published connection workflow grants align in both catalog modes", async () => {
+    const grants = [
+      { provider: "github", resource: "actions_run_trigger", action: "write" },
+      { provider: "github", resource: "search_repositories", action: "read" },
+      { provider: "github", resource: "get_me", action: "read" },
+      { provider: "github", resource: "get_file_contents", action: "read" },
+      { provider: "github", resource: "actions_list", action: "read" },
+      { provider: "github", resource: "actions_get", action: "read" },
+      { provider: "github", resource: "get_job_logs", action: "read" },
+      { provider: "github", resource: "get_commit", action: "read" },
+      { provider: "github", resource: "list_pull_requests", action: "read" },
+      { provider: "github", resource: "create_branch", action: "write" },
+      { provider: "github", resource: "push_files", action: "write" },
+      { provider: "github", resource: "create_pull_request", action: "write" },
+    ];
+
+    for (const governanceCatalogId of [undefined, GITHUB_MCP_CATALOG_ID]) {
+      const called: string[] = [];
+      const handler = createGithubMcpProxyHandler({
+        upstreamUrl: "http://github-mcp:8082/mcp",
+        governanceCatalogId,
+        authenticate: () =>
+          Promise.resolve({
+            ...identity,
+            claims: withTaskAuthority({ ...taskAuthority, tools: grants }),
+          }),
+        getOAuthStatus: () =>
+          Promise.resolve({
+            connected: true,
+            scopesRequired: [],
+            scopesGranted: [],
+            missingScopes: [],
+          }),
+        resolveGithubToken: () => Promise.resolve("provider-token"),
+        fetch: async (request) => {
+          const payload = (await request.json()) as { id: string; params: { name: string } };
+          called.push(payload.params.name);
+          return Response.json({ jsonrpc: "2.0", id: payload.id, result: { ok: true } });
+        },
+      });
+
+      const listed = (await (
+        await rpc(handler, { jsonrpc: "2.0", id: "list", method: "tools/list", params: {} })
+      ).json()) as { result: { tools: { name: string }[] } };
+      const listedNames = new Set(listed.result.tools.map((tool) => tool.name));
+      for (const grant of grants) expect(listedNames.has(grant.resource)).toBe(true);
+
+      for (const grant of grants) {
+        const args = grant.resource === "actions_run_trigger" ? { method: "run_workflow" } : {};
+        const response = await rpc(handler, {
+          jsonrpc: "2.0",
+          id: grant.resource,
+          method: "tools/call",
+          params: { name: grant.resource, arguments: args },
+        });
+        expect(await response.json()).toMatchObject({ result: { ok: true } });
+      }
+      expect(called).toEqual(grants.map((grant) => grant.resource));
+    }
+  });
+
+  test("enforces exact Task grants after validating a real signed HOP-1 token", async () => {
+    const pair = await generateKeyPair("EdDSA", { extractable: true });
+    const publicJwk = {
+      ...(await exportJWK(pair.publicKey)),
+      alg: "EdDSA",
+      kid: "task-fixture-key",
+      use: "sig",
+    };
+    const authenticate = createAuthenticator({
+      issuers: [
+        {
+          profile: {
+            name: "task-fixture",
+            issuer: taskClaims.iss,
+            audiences: taskClaims.aud,
+            allowedAlgorithms: ["EdDSA"],
+            emailClaim: "email",
+          },
+          jwksProvider: () => Promise.resolve([publicJwk]),
+        },
+      ],
+    });
+    const sign = (authority: unknown) =>
+      new SignJWT({
+        email: taskClaims.email,
+        azp: taskClaims.azp,
+        jti: taskClaims.jti,
+        [TASK_AUTHORITY_CLAIM]: authority,
+      })
+        .setProtectedHeader({ alg: "EdDSA", kid: "task-fixture-key" })
+        .setIssuer(taskClaims.iss)
+        .setAudience(taskClaims.aud)
+        .setSubject(taskClaims.sub)
+        .setIssuedAt()
+        .setExpirationTime("5m")
+        .sign(pair.privateKey);
+    const taskToken = await sign({
+      ...taskAuthority,
+      tools: [{ provider: "github", resource: "get_file_contents", action: "read" }],
+    });
+    let upstreamCalls = 0;
+    const handler = createGithubMcpProxyHandler({
+      upstreamUrl: "http://github-mcp:8082/mcp",
+      governanceCatalogId: GITHUB_MCP_CATALOG_ID,
+      githubToolsets: ["repos"],
+      authenticate,
+      getOAuthStatus: () =>
+        Promise.resolve({
+          connected: true,
+          scopesRequired: ["repo"],
+          scopesGranted: ["repo"],
+          missingScopes: [],
+        }),
+      resolveGithubToken: () => Promise.resolve("provider-token"),
+      fetch: async (request) => {
+        upstreamCalls += 1;
+        const payload = (await request.json()) as { id: string };
+        return Response.json({ jsonrpc: "2.0", id: payload.id, result: { ok: true } });
+      },
+    });
+
+    const listed = await rpc(
+      handler,
+      { jsonrpc: "2.0", id: "signed-list", method: "tools/list", params: {} },
+      taskToken,
+    );
+    expect(
+      ((await listed.json()) as { result: { tools: { name: string }[] } }).result.tools.map(
+        (tool) => tool.name,
+      ),
+    ).toEqual(["github_oauth_status", "github_oauth_start", "get_file_contents"]);
+
+    expect(
+      await (
+        await rpc(
+          handler,
+          {
+            jsonrpc: "2.0",
+            id: "signed-allowed",
+            method: "tools/call",
+            params: { name: "get_file_contents", arguments: {} },
+          },
+          taskToken,
+        )
+      ).json(),
+    ).toMatchObject({ result: { ok: true } });
+    for (const deniedName of ["list_commits", "create_branch"]) {
+      const denied = await rpc(
+        handler,
+        {
+          jsonrpc: "2.0",
+          id: deniedName,
+          method: "tools/call",
+          params: { name: deniedName, arguments: {} },
+        },
+        taskToken,
+      );
+      expect(await denied.json()).toMatchObject({
+        result: {
+          isError: true,
+          structuredContent: { error: "task_tool_not_approved" },
+        },
+      });
+    }
+    expect(upstreamCalls).toBe(1);
+
+    const missingTools = { ...taskAuthority };
+    delete missingTools.tools;
+    for (const authority of [missingTools, { ...taskAuthority, tools: "invalid" }]) {
+      const token = await sign(authority);
+      const response = await rpc(
+        handler,
+        { jsonrpc: "2.0", id: "closed-list", method: "tools/list", params: {} },
+        token,
+      );
+      expect(
+        ((await response.json()) as { result: { tools: { name: string }[] } }).result.tools.map(
+          (tool) => tool.name,
+        ),
+      ).toEqual(["github_oauth_status", "github_oauth_start"]);
+    }
+  });
+
+  test("authorizes GitHub aliases by their canonical resource name", async () => {
+    let upstreamCalls = 0;
+    const taskIdentity: Hop1Identity = {
+      ...identity,
+      claims: withTaskAuthority({
+        ...taskAuthority,
+        tools: [{ provider: "github", resource: "get_file_contents", action: "read" }],
+      }),
+    };
+    const handler = createGithubMcpProxyHandler({
+      upstreamUrl: "http://github-mcp:8082/mcp",
+      governanceCatalogId: GITHUB_MCP_CATALOG_ID,
+      githubToolsets: ["repos"],
+      authenticate: () => Promise.resolve(taskIdentity),
+      taskToolAuthorization: {},
+      aliases: { github_contents_get: "get_file_contents" },
+      resolveGithubToken: () => Promise.resolve("provider-token"),
+      fetch: async (request) => {
+        upstreamCalls += 1;
+        const payload = (await request.json()) as { id: string; params: { name: string } };
+        expect(payload.params.name).toBe("get_file_contents");
+        return Response.json({ jsonrpc: "2.0", id: payload.id, result: { ok: true } });
+      },
+    });
+
+    const response = await rpc(handler, {
+      jsonrpc: "2.0",
+      id: "alias",
+      method: "tools/call",
+      params: { name: "github_contents_get", arguments: {} },
+    });
+
+    expect(await response.json()).toMatchObject({ result: { ok: true } });
+    expect(upstreamCalls).toBe(1);
+  });
 
   test("renews and retries exactly once after a classified upstream credential rejection", async () => {
     const authorizations: string[] = [];
@@ -505,7 +1021,7 @@ describe("GitHub MCP proxy wrapper", () => {
     ]);
   });
 
-  test("surfaces missing GitHub credentials as an MCP unauthorized error", async () => {
+  test("rejects an empty request body before resolving GitHub credentials", async () => {
     const handler = createGithubMcpProxyHandler({
       upstreamUrl: "http://github-mcp:8082/mcp",
       authenticate: () => Promise.resolve(identity),
@@ -522,13 +1038,13 @@ describe("GitHub MCP proxy wrapper", () => {
       }),
     );
 
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
       jsonrpc: "2.0",
       id: null,
       error: {
-        code: -32001,
-        message: "Unauthorized: GitHub account is not connected",
+        code: -32600,
+        message: "Invalid Request",
       },
     });
   });
@@ -1030,7 +1546,6 @@ describe("GitHub MCP proxy wrapper", () => {
           body: requestBody,
         }),
       );
-      expect(response.status).not.toBe(200);
       const responseBody = await response.text();
       if (responseBody) {
         const responsePayload = JSON.parse(responseBody) as unknown;
@@ -1310,7 +1825,7 @@ describe("GitHub MCP proxy wrapper", () => {
     expect(body.result.tools.slice(2)).toEqual(upstreamTools);
   });
 
-  test("keeps absent-pin legacy classifications and forwards unknown upstream tools", async () => {
+  test("uses published classifications for pinned tools and legacy fallback for unknown tools", async () => {
     const policyInputs: ToolPolicyInput[] = [];
     const upstreamNames: string[] = [];
     const handler = createGithubMcpProxyHandler({
@@ -1347,10 +1862,10 @@ describe("GitHub MCP proxy wrapper", () => {
     }
 
     expect(policyInputs.map(({ tool, actionClass }) => [tool, actionClass])).toEqual([
-      ["get_discussion_comments", "write"],
-      ["list_pull_requests", "write"],
-      ["pull_request_read", "write"],
-      ["search_pull_requests", "write"],
+      ["get_discussion_comments", "read"],
+      ["list_pull_requests", "read"],
+      ["pull_request_read", "read"],
+      ["search_pull_requests", "read"],
       ["future_github_tool", "read"],
     ]);
     expect(upstreamNames).toEqual([
@@ -1763,12 +2278,13 @@ describe("GitHub MCP proxy wrapper", () => {
 function rpc(
   handler: (request: Request) => Promise<Response>,
   payload: Record<string, unknown>,
+  token = "hop1-token",
 ): Promise<Response> {
   return handler(
     new Request("http://wrapper/mcp", {
       method: "POST",
       headers: {
-        authorization: "Bearer hop1-token",
+        authorization: `Bearer ${token}`,
         "content-type": "application/json",
         "mcp-protocol-version": "2025-06-18",
       },

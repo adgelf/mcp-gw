@@ -56,6 +56,77 @@ diagnostic category. Operators should correct the governing-platform login
 email or add and verify that address in GitHub before starting a new consent
 flow.
 
+## Task-approved tool boundary
+
+When the governing platform identifies a bearer token as a Task token,
+MCP-GW limits both `tools/list` and `tools/call` to that Task's exact approved
+tools. Enforcement happens in every authenticated wrapper, including direct
+wrapper access, so bypassing AgentGateway does not widen authority. The
+wrapper's checked-in catalog and policy remain additional narrowing barriers;
+neither can add authority absent from the Task approval.
+
+Approval coordinates map to public MCP tools as follows:
+
+- GitHub uses provider `github`, the canonical GitHub tool name as the
+  resource, and the resolved catalog action. A compatibility alias is
+  authorized by its canonical target, not by the alias.
+- Google Workspace uses the catalog service as the provider, the exact exposed
+  tool name (including its `gws_` or `google_` prefix) as the resource, and the
+  catalog action. The low-level `google_workspace_gws` tool requires its own
+  explicit approval and cannot borrow approval for the command it carries.
+- Generic wrappers use the OAuth `providerId` (or descriptor name when no
+  provider ID exists), the final prefixed/aliased MCP name, and the governed
+  catalog action. For example, a Jira decision alias is approved under its
+  exposed `jira_...` name, not the upstream vendor name.
+
+Connection helpers (`*_oauth_status` and `*_oauth_start`) remain visible and
+callable so a Task can diagnose or establish a provider connection. Existing
+wrapper policy still governs those helpers, and they do not grant provider
+data access. Interactive tokens without Task authority and the purpose-bound
+provider-connection status bridge retain their existing HTTP behavior; the
+bridge is restricted to its exact status grant when presented to an MCP
+wrapper.
+
+The shared reader pins each governing-platform value deliberately:
+
+| Contract value                                                                                                                                   | Reader                           | Failure prevented                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------- | ------------------------------------------------------------------------------- |
+| Nested authority claim `steward`                                                                                                                 | `parseTaskToolAuthorization`     | Keeps ordinary interactive tokens outside the Task-only filter.                 |
+| Authority `version: 3`                                                                                                                           | `isCurrentTaskMarker`            | Rejects tool approvals whose schema semantics are not current.                  |
+| `acting_as` equal to `user`, `service`, or `service_for_user`                                                                                    | `isLegacyTaskMarker`             | Rejects an unknown or missing actor mode.                                       |
+| A non-empty `runtime_uid` and no `purpose` on Task tokens                                                                                        | `isLegacyTaskMarker`             | Distinguishes executable Task authority from purpose-bound service authority.   |
+| Status bridge service `steward-apiserver`, `acting_as: service_for_user`, `purpose: provider_connection_status`, no `runtime_uid`, and version 3 | `connectionStatusAuthorityGrant` | Prevents another service or purpose from receiving the status bridge exception. |
+| Exactly one status bridge tuple `{ provider: github, resource: provider-control, action: status }`                                               | `connectionStatusAuthorityGrant` | Limits the bridge to the connection-status authority it was issued.             |
+| Exact tuple keys `provider`, `resource`, and `action`, each a non-empty string                                                                   | `parseGrant`                     | Rejects partial, extended, or ambiguous tool approvals.                         |
+
+Task tokens with missing, malformed, or unmapped tool approvals fail closed:
+only the connection helpers are exposed. During one compatibility release,
+operators upgrading an older governing platform may explicitly opt out:
+
+```yaml
+taskToolAuthorization:
+  # Unsafe temporary bridge: upgrade the Task-token issuer, then remove this.
+  allowLegacyUnscopedTaskTokens: true
+```
+
+The chart value
+`taskToolAuthorization.allowLegacyUnscopedTaskTokens` defaults to `false`.
+Tokens carrying approvals under authority version 1 or 2 fail closed, even
+when the opt-out is enabled. The supported governing-platform issuer already
+emits version 3 with approvals; the opt-out exists only for a custom legacy
+issuer that otherwise has a valid Task marker but omits the approval field.
+Malformed or empty approvals still fail closed. Direct Compose deployments can
+set the equivalently loud
+`MCP_GW_ALLOW_LEGACY_UNSCOPED_TASK_TOKENS=true` environment variable. Changing
+either setting updates wrapper environment and requires the affected Pods or
+containers to restart.
+
+The wrappers own this boundary. AgentGateway routing by itself does not inspect
+Task tool approvals. The built-in GitHub backend must target the GitHub wrapper,
+and db-mcp must use `dbMcp.wrapper.enabled=true` before it is exposed to Task
+tokens. An externally hosted or otherwise direct backend must implement and
+test the same approval contract itself.
+
 ## External policy endpoint
 
 Set the chart-wide typed value `policy.opaUrl` to one OPA-compatible decision
