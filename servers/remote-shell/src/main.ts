@@ -1,25 +1,10 @@
-import {
-  validateHop1IssuerProfiles,
-  type Hop1IssuerConfig,
-  type Hop1Identity,
-} from "../../../shared/identity/hop1";
+import { validateHop1IssuerProfiles, type Hop1IssuerConfig } from "../../../shared/identity/hop1";
 import {
   createAuthenticator,
   createRemoteJwksProvider,
 } from "../../../packages/wrapper-kit/src/authenticator";
-import { createAuthenticatedMcpHttpHandler } from "../../../packages/wrapper-kit/src/mcp/authenticated-http";
-import {
-  createRemoteShellRegistry,
-  type RemoteShellAuditSink,
-  type RemoteShellBinding,
-} from "./registry";
-import {
-  createAwsCliRunner,
-  createSsmRunCommand,
-  credentialValues,
-  type SsmRunRequest,
-  type SsmRunResult,
-} from "./ssm-run-command";
+import { createRemoteShellHttpHandler, type RemoteShellBinding } from "./http";
+import { createAwsCliRunner, createSsmRunCommand, credentialValues } from "./ssm-run-command";
 
 const INSTANCE_ID = /^i-[0-9a-f]{8}(?:[0-9a-f]{9})?$/;
 const ROLE = /^[a-z][a-z0-9-]{0,62}$/;
@@ -31,6 +16,12 @@ export interface RemoteShellConfig {
   runTagKey: string;
   maxTimeoutSeconds: number;
   maxOutputBytes: number;
+  requestLimits: { maxBodyBytes: number; maxCommandBytes: number };
+  jobLimits: {
+    maxJobs: number;
+    maxRunningJobsPerOwner: number;
+    retentionSeconds: number;
+  };
   hop1Issuers: Hop1IssuerConfig[];
   bindings: RemoteShellBinding[];
 }
@@ -55,6 +46,14 @@ export function loadRemoteShellConfig(
   const hop1Issuers = validateHop1IssuerProfiles(
     rawIssuers.map((value) => issuerWithCredential(value, env)),
   );
+  const maxCommandBytes = integer(env.REMOTE_SHELL_MAX_COMMAND_BYTES, 16 * 1024, 1, 1024 * 1024);
+  const maxBodyBytes = integer(
+    env.REMOTE_SHELL_MAX_BODY_BYTES,
+    17 * 1024,
+    maxCommandBytes,
+    2 * 1024 * 1024,
+  );
+  const maxJobs = integer(env.REMOTE_SHELL_MAX_JOBS, 64, 1, 4096);
 
   return {
     port: integer(env.PORT, 8080, 1, 65_535),
@@ -63,23 +62,15 @@ export function loadRemoteShellConfig(
     runTagKey: text(env.REMOTE_SHELL_RUN_TAG_KEY) ?? "hypershell:run-id",
     maxTimeoutSeconds: integer(env.REMOTE_SHELL_MAX_TIMEOUT_SECONDS, 60, 10, 3_600),
     maxOutputBytes: integer(env.REMOTE_SHELL_MAX_OUTPUT_BYTES, 24 * 1024, 1, 1024 * 1024),
+    requestLimits: { maxBodyBytes, maxCommandBytes },
+    jobLimits: {
+      maxJobs,
+      maxRunningJobsPerOwner: integer(env.REMOTE_SHELL_MAX_RUNNING_JOBS_PER_OWNER, 4, 1, maxJobs),
+      retentionSeconds: integer(env.REMOTE_SHELL_JOB_RETENTION_SECONDS, 30 * 60, 1, 86_400),
+    },
     hop1Issuers,
     bindings: validBindings,
   };
-}
-
-export function createRemoteShellHandler(options: {
-  authenticate(token: string): Promise<Hop1Identity>;
-  bindings: readonly RemoteShellBinding[];
-  maxTimeoutSeconds: number;
-  execute(request: SsmRunRequest): Promise<SsmRunResult>;
-  audit?: RemoteShellAuditSink;
-}): (request: Request) => Promise<Response> {
-  return createAuthenticatedMcpHttpHandler({
-    serverInfo: { name: "remote-shell", version: "0.1.0" },
-    authenticate: (token) => options.authenticate(token),
-    registryFor: (identity) => createRemoteShellRegistry({ ...options, identity }),
-  });
 }
 
 function issuerWithCredential(
@@ -160,11 +151,13 @@ if (import.meta.main) {
         : {}),
     })),
   });
-  const handler = createRemoteShellHandler({
+  const handler = createRemoteShellHttpHandler({
     authenticate,
     bindings: config.bindings,
     maxTimeoutSeconds: config.maxTimeoutSeconds,
-    execute: createSsmRunCommand({
+    requestLimits: config.requestLimits,
+    jobLimits: config.jobLimits,
+    ssm: createSsmRunCommand({
       runner,
       region: config.awsRegion,
       runTagKey: config.runTagKey,
