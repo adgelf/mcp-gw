@@ -569,6 +569,7 @@ describe("generic MCP proxy", () => {
       lifecycleRoutes: true,
       hideToolsUntilConnected: true,
       lifecycleToolNames: { start: "auth_start", status: "auth_status" },
+      credential: jiraDescriptor.credential,
     };
     const hiddenCatalog: GenericToolCatalog = {
       ...catalog,
@@ -582,6 +583,7 @@ describe("generic MCP proxy", () => {
     const hiddenHandler = (
       resolveCredential: () => Promise<{ header: string; value: string } | null>,
       overrides: Partial<GenericWrapperDescriptor> = {},
+      audit?: InMemoryAuditSink,
     ) =>
       createGenericMcpProxyHandler({
         descriptor: { ...hiddenDescriptor, ...overrides },
@@ -590,6 +592,7 @@ describe("generic MCP proxy", () => {
         transport: new RecordingTransport(),
         resolveCredential,
         requireCredential: true,
+        audit,
         oauth,
       });
     const listedNames = async (response: Response) =>
@@ -623,6 +626,52 @@ describe("generic MCP proxy", () => {
       );
 
       expect(await listedNames(response)).toEqual(["orrery_auth_status", "orrery_auth_start"]);
+    });
+
+    test("marks a credential-resolution failure as unavailable and audits it, still listing helpers only", async () => {
+      const audit = new InMemoryAuditSink();
+      const response = await hiddenHandler(
+        () => Promise.reject(new Error("store down")),
+        {},
+        audit,
+      )(mcpRequest("tools/list", {}, 1));
+      const body = (await response.json()) as {
+        result: { tools: { name: string }[]; _meta?: Record<string, unknown> };
+      };
+
+      expect(body.result.tools.map((tool) => tool.name)).toEqual([
+        "orrery_auth_status",
+        "orrery_auth_start",
+      ]);
+      expect(body.result._meta).toEqual({
+        "mcp-gw/catalog": {
+          status: "unavailable",
+          error: "Upstream tool discovery is unavailable",
+        },
+      });
+      expect(audit.events).toMatchObject([
+        {
+          category: "tool_call",
+          status: "error",
+          event: "tools_list_credential_unavailable",
+          error: "credential_resolution_failed",
+        },
+      ]);
+    });
+
+    test("marks a missing credential as authorization-required with the configured helper", async () => {
+      const response = await hiddenHandler(() => Promise.resolve(null))(
+        mcpRequest("tools/list", {}, 1),
+      );
+      const body = (await response.json()) as { result: { _meta?: Record<string, unknown> } };
+
+      expect(body.result._meta).toEqual({
+        "mcp-gw/catalog": {
+          status: "unavailable",
+          error: "Provider authorization is required",
+          connectionHelper: "orrery_auth_start",
+        },
+      });
     });
 
     test("still lists the whole catalog when the flag is off", async () => {

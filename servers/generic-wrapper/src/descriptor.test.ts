@@ -65,16 +65,18 @@ describe("generic wrapper descriptor", () => {
   });
 
   test("rejects malformed, equal, and unknown lifecycleToolNames fields", () => {
-    for (const lifecycleToolNames of [
-      { start: "bad name" },
-      { start: "same", status: "same" },
-      { start: "a", extra: "b" },
-    ]) {
+    for (const [lifecycleToolNames, message] of [
+      [{ start: "bad name" }, "lifecycleToolNames.start has an invalid format"],
+      [{ start: "same", status: "same" }, "lifecycleToolNames.start and status must differ"],
+      [{ start: "a", extra: "b" }, "Unsupported lifecycleToolNames field: extra"],
+    ] as const) {
       expect(() =>
         parseGenericWrapperDescriptor({ ...baseDescriptor, lifecycleToolNames }),
-      ).toThrow();
+      ).toThrow(message);
     }
-    expect(() => parseGenericWrapperDescriptor({ ...baseDescriptor, unknownField: 1 })).toThrow();
+    expect(() => parseGenericWrapperDescriptor({ ...baseDescriptor, unknownField: 1 })).toThrow(
+      "Unsupported descriptor field: unknownField",
+    );
   });
 
   test("parses every supported credential and upstream mode without secret values", () => {
