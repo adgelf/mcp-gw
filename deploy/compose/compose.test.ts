@@ -60,6 +60,42 @@ describe("Docker Compose deployment skeleton", () => {
     expect(envExample).not.toContain("HOP1_ISSUER=https://accounts.google.com");
   });
 
+  test("provides an opt-in built-in OAuth broker overlay", async () => {
+    const [overlay, gateway, envExample] = await Promise.all([
+      readFile("deploy/compose/docker-compose.broker.yaml", "utf8"),
+      readFile("gateway/agentgateway/local-broker.yaml", "utf8"),
+      readFile("deploy/compose/.env.example", "utf8"),
+    ]);
+
+    expect(overlay).toContain('MCP_BROKER_ENABLED: "true"');
+    expect(overlay).toContain('MCP_DCR_ENABLED: "true"');
+    expect(overlay).toContain("${BROKER_GATEWAY_CONFIG:?");
+    expect(overlay).toContain("${LOCAL_BROKER_SIGNING_JWKS_DIR:?");
+    expect(overlay).toContain("/var/run/secrets/mcp-gateway/broker:ro");
+    expect(gateway).toContain("issuer: https://mcp.example.com/oauth");
+    expect(gateway).toContain("url: http://google-workspace:8080/oauth/.well-known/jwks.json");
+    for (const path of [
+      "/.well-known/oauth-authorization-server/oauth",
+      "/oauth/authorize",
+      "/oauth/token",
+      "/oauth/register",
+      "/oauth/google/broker/callback",
+      "/oauth/google/callback",
+    ]) {
+      expect(gateway).toContain(`exact: ${path}`);
+    }
+    for (const key of [
+      "MCP_AUTHORIZATION_ISSUER=",
+      "MCP_RESOURCE_URI=",
+      "MCP_BROKER_GOOGLE_REDIRECT_URI=",
+      "MCP_BROKER_ACTIVE_KID=",
+      "LOCAL_BROKER_SIGNING_JWKS_DIR=",
+      "BROKER_GATEWAY_CONFIG=",
+    ]) {
+      expect(envExample).toContain(key);
+    }
+  });
+
   test("has a Dockerfile that runs the Google Workspace wrapper entrypoint", async () => {
     const dockerfile = await readFile("servers/google-workspace/wrapper/Dockerfile", "utf8");
 
