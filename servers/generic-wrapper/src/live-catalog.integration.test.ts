@@ -266,6 +266,8 @@ function liveHandler(options: {
     toolPrefix: "jira",
     catalogPath: "/app/servers/generic-wrapper/catalog/jira/decisions.yaml",
     lifecycleRoutes: true,
+    hideToolsUntilConnected: false,
+    lifecycleToolNames: { start: "oauth_start", status: "oauth_status" },
     upstream,
     credential: {
       mode: "per_user_oauth",

@@ -172,6 +172,23 @@ export function createGenericMcpProxyHandler(
       return new Response(null, { status: 202 });
     }
     if (message.method === "tools/list") {
+      if (options.descriptor.hideToolsUntilConnected) {
+        const invalidSession = validateRequestSession(options.transport, request, identity);
+        if (invalidSession) return invalidSession;
+        // Fail closed: only a resolved credential reveals the catalog.
+        let connected = false;
+        try {
+          connected =
+            (await options.resolveCredential({ identity, hop1Token, scopes: [] })) !== null;
+        } catch {
+          connected = false;
+        }
+        if (!connected) {
+          return mcpResult(message.id, {
+            tools: taskAuthorization.allowsConnectionHelpers ? oauthToolDefinitions(options) : [],
+          });
+        }
+      }
       if (isLiveToolCatalog(options.catalog)) {
         const invalidSession = validateRequestSession(options.transport, request, identity);
         if (invalidSession) return invalidSession;
@@ -366,13 +383,13 @@ export function createGenericMcpProxyHandler(
           content: [
             {
               type: "text",
-              text: `Provider authorization is required. Call ${options.descriptor.toolPrefix}_oauth_start.`,
+              text: `Provider authorization is required. Call ${lifecycleToolName(options, "start")}.`,
             },
           ],
           structuredContent: {
             error: "provider_oauth_required",
             provider: options.oauth?.providerId,
-            connectionHelper: `${options.descriptor.toolPrefix}_oauth_start`,
+            connectionHelper: lifecycleToolName(options, "start"),
           },
         });
       }
@@ -552,16 +569,15 @@ function oauthToolDefinitions(
   options: CreateGenericMcpProxyHandlerOptions,
 ): Record<string, unknown>[] {
   if (!options.oauth || !options.descriptor.lifecycleRoutes) return [];
-  const prefix = options.descriptor.toolPrefix;
   return [
     {
-      name: `${prefix}_oauth_status`,
+      name: lifecycleToolName(options, "status"),
       description: `Check the ${options.oauth.providerId} connection for the current user.`,
       inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
       annotations: { readOnlyHint: true },
     },
     {
-      name: `${prefix}_oauth_start`,
+      name: lifecycleToolName(options, "start"),
       description: `Start ${options.oauth.providerId} authorization for the current user.`,
       inputSchema: {
         type: "object",
@@ -579,9 +595,16 @@ function oauthToolKind(
   name: string | undefined,
 ): "status" | "start" | undefined {
   if (!options.oauth || !options.descriptor.lifecycleRoutes) return undefined;
-  if (name === `${options.descriptor.toolPrefix}_oauth_status`) return "status";
-  if (name === `${options.descriptor.toolPrefix}_oauth_start`) return "start";
+  if (name === lifecycleToolName(options, "status")) return "status";
+  if (name === lifecycleToolName(options, "start")) return "start";
   return undefined;
+}
+
+function lifecycleToolName(
+  options: CreateGenericMcpProxyHandlerOptions,
+  kind: "start" | "status",
+): string {
+  return `${options.descriptor.toolPrefix}_${options.descriptor.lifecycleToolNames[kind]}`;
 }
 
 interface ParsedMessage {
@@ -649,7 +672,7 @@ async function liveToolsList(
   }
   if (!credential) {
     return liveCatalogUnavailable(id, helpers, "Provider authorization is required", {
-      connectionHelper: `${options.descriptor.toolPrefix}_oauth_start`,
+      connectionHelper: lifecycleToolName(options, "start"),
     });
   }
   try {
@@ -886,7 +909,7 @@ function providerFailure(
           ? options.descriptor.credential.providerId
           : undefined),
       ...(error === "provider_oauth_required"
-        ? { connectionHelper: `${options.descriptor.toolPrefix}_oauth_start` }
+        ? { connectionHelper: lifecycleToolName(options, "start") }
         : {}),
       ...(retryAfter ? { retryAfter } : {}),
     },
