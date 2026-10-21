@@ -790,6 +790,40 @@ describe("Kubernetes production chart", () => {
     expect(result.stderr.toString()).toContain("per_user_oauth");
   });
 
+  test("checks catalog collisions against renamed lifecycle helpers", () => {
+    const base = genericOAuthWrapper("search-one", "search_one", "search-provider");
+    const render = (wrapper: Record<string, unknown>) =>
+      helmTemplateResult([
+        ...genericWrapperBaseArgs(),
+        ...lifecycleCallerArgs(),
+        "--set-json",
+        `wrappers=${JSON.stringify([wrapper])}`,
+      ]);
+    const catalog = base.catalog as { tools: Record<string, unknown>[] };
+
+    const collides = render({
+      ...base,
+      lifecycleToolNames: { start: "query", status: "auth_status" },
+    });
+    assertHelmRejected(collides);
+    expect(collides.stderr.toString()).toContain(
+      "generic wrapper lifecycle helper search_one_query collides with a catalog tool",
+    );
+
+    const freedDefault = render({
+      ...base,
+      catalog: { ...catalog, tools: [{ ...catalog.tools[0], name: "oauth_start" }] },
+      lifecycleToolNames: { start: "auth_start", status: "auth_status" },
+    });
+    expect(freedDefault.exitCode, freedDefault.stderr.toString()).toBe(0);
+
+    const same = render({ ...base, lifecycleToolNames: { start: "auth", status: "auth" } });
+    assertHelmRejected(same);
+    expect(same.stderr.toString()).toContain(
+      "lifecycleToolNames.start and lifecycleToolNames.status must differ",
+    );
+  });
+
   test("renders a generic per-user OAuth wrapper when migrations are applied separately", () => {
     const wrapper = genericOAuthWrapper("search-one", "search_one", "search-provider");
     const rendered = helmTemplate([
